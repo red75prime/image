@@ -9,7 +9,8 @@ use color::ColorType:: {
     Palette,
     GrayA,
     RGB,
-    RGBA
+    RGBA,
+    RGBE,
 };
 
 /// A representation of a PPM encoder.
@@ -86,6 +87,7 @@ fn max_pixel_value(pixel_type: color::ColorType) -> u16 {
         RGB(n)     => 2u16.pow(n as u32) - 1,
         Palette(n) => 2u16.pow(n as u32) - 1,
         GrayA(n)   => 2u16.pow(n as u32) - 1,
-        RGBA(n)    => 2u16.pow(n as u32) - 1
+        RGBA(n)    => 2u16.pow(n as u32) - 1,
+        RGBE(n)    => unimplemented!(),
     }
 }

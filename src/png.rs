@@ -133,7 +133,8 @@ impl From<ColorType> for (png::ColorType, png::BitDepth) {
             ColorType::RGB(bits) => (RGB, bits),
             ColorType::Palette(bits) => (Indexed, bits),
             ColorType::GrayA(bits) => (GrayscaleAlpha, bits),
-            ColorType::RGBA(bits) => (RGBA, bits)
+            ColorType::RGBA(bits) => (RGBA, bits),
+            ColorType::RGBE(bits) => unimplemented!(),
         };
         (ct, png::BitDepth::from_u8(bits).unwrap())
     }
