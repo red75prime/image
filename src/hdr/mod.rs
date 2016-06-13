@@ -7,4 +7,6 @@
 //!  * http://www.cs.virginia.edu/~jcw5q/apps/imageview/src/libimageviewer/hdr.c
 //!
 
+pub use self::hdr_decoder::HDRDecoder;
 
+mod hdr_decoder;
