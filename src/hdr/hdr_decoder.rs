@@ -26,7 +26,15 @@ pub struct HDRDecoder<R> {
     color_correction: (f32,f32,f32),
     software: String,
     pixel_aspect_ratio: f32,
-    primaries: ((f32, f32), (f32, f32), (f32, f32), (f32, f32)),
+    //primaries: ((f32, f32), (f32, f32), (f32, f32), (f32, f32)),
+}
+
+#[repr(C)] #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RGBE8Pixel {
+    r: u8,
+    g: u8,
+    b: u8,
+    e: u8,
 }
 
 impl<R: Read + Seek> HDRDecoder<R> {
@@ -41,31 +49,22 @@ impl<R: Read + Seek> HDRDecoder<R> {
     /// or returns error if it cannot parse a header
     /// strict enables strict mode
     pub fn with_strictness(mut reader: R, strict: bool) -> ImageResult<HDRDecoder<R>> {  
-        // default values for attributes  
-        let mut exposure = 1.;
-        let mut color_correction = (1., 1., 1.);
-        let mut software = "".into();
-        let mut pixel_aspect_ratio = 1.;
-        let mut primaries = ((0.640, 0.330), (0.290, 0.600), (0.150, 0.060), (0.333, 0.333));
+        
+        let mut attributes = HeaderInfo::new();  
 
         { // scope to make borrowck happy
             let r = &mut reader;
             let mut signature = [0; SIGNATURE_LENGTH];
-
             try!(r.read_exact(&mut signature));
-
             if signature != SIGNATURE {
                 return Err(ImageError::FormatError("Radiance HDR signature not found".to_string()));
             } // no else
-
             // skip signature line ending
             try!(read_line_u8(r));
-
             // read header data until empty line
             loop {
                 match try!(read_line_u8(r)) {
-                    None => {
-                        // EOF before end of header
+                    None => { // EOF before end of header
                         return Err(ImageError::NotEnoughData);
                     },
                     Some(line) => {
@@ -76,33 +75,9 @@ impl<R: Read + Seek> HDRDecoder<R> {
                             // skip comments
                             continue;
                         } // no else
+                        // process attribute line
                         let line = String::from_utf8_lossy(&line[..]);
-                        match split_at_first(&line, "=") {
-                            Some(("FORMAT", val)) => {
-                                if val.trim() != "32bit_rle_rgbe" {
-                                    // XYZE isn't supported yet
-                                    return Err(ImageError::UnsupportedError(val.into()));
-                                }
-                            },
-                            Some(("EXPOSURE", val)) => {
-                                let multiplier = try!(val.trim().parse::<f32>().into_image_error("Cannot parse EXPOSURE value:")); 
-                                exposure *= multiplier;
-                            },
-                            Some(("SOFTWARE", val)) => {
-                                software = val.into();
-                            },
-                            None => {
-                                if strict {
-                                    // TODO: limit reported line length  
-                                    return Err(ImageError::FormatError(format!("Malformed attribute '{}'", line)));
-                                } else {
-                                    // skip malformed attribute
-                                }
-                            },
-                            _ => {
-                                // TODO: process other attributes
-                            },
-                        } // match attributes
+                        try!(attributes.update_header_info(&line, strict));
                     }, // <= Some(line)
                 } // match read_line_u8()
             } // loop
@@ -125,16 +100,258 @@ impl<R: Read + Seek> HDRDecoder<R> {
 
             width: width,
             height: height,
-            exposure: exposure,
-            color_correction: color_correction,
-            software: software,
-            pixel_aspect_ratio: pixel_aspect_ratio,
-            primaries: primaries,
+            exposure: attributes.exposure.unwrap_or(1.),
+            color_correction: attributes.color_correction.unwrap_or((1., 1., 1.)),
+            software: attributes.software.unwrap_or("".into()),
+            pixel_aspect_ratio: attributes.pixel_aspect_ratio.unwrap_or(1.),
+            //primaries: primaries,
         })
+    } // end with_strictness
+
+    /// Values of pixels should be divided by this to get physical radiance in watts/steradian/m^2
+    pub fn exposure(&self) -> f32 {
+        self.exposure
+    } 
+
+    /// Correction for R, G, B channels. Pixel color values should be divided by corresponing value
+    pub fn color_correction(&self) -> (f32, f32, f32) {
+        self.color_correction
+    }
+
+    /// Software used to create the picture
+    /// Not useful. All hdr files I've seen use comments to indentify software
+    pub fn software(&self) -> &String {
+        &self.software
+    }
+
+    /// Height of pixel divided by width
+    pub fn pixel_aspect_ratio(&self) -> f32 {
+        self.pixel_aspect_ratio
+    }
+
+    /// Returns a vector of decompressed RGBE8 pixels
+    pub fn read_image_native(&mut self) -> ImageResult<Vec<RGBE8Pixel>> {
+        let pixel_count = self.width as usize * self.height as usize;
+        let mut ret = Vec::<RGBE8Pixel>::with_capacity(pixel_count);
+        unsafe {
+            // RGBE8Pixel doesn't implement Drop, so it's Ok to drop half-initialized ret
+            ret.set_len(pixel_count);
+        } // ret contains uninitialized data, so now it's my responsibility to return fully initialized ret
+        for y in 0 .. self.height as usize {
+            // first 4 bytes in scanline allow to determine comression method
+            let fb = try!(read_rgbe(&mut self.r));
+            if fb.r == 2 && fb.g == 2 && fb.b < 128 {
+                // denormalized pixel value (2,2,<128,_) indicates new per component RLE method
+                let y_off = y * self.width as usize;
+                // ret[y_off + x_off] can panic
+                // TODO: bounds checking in decode_component
+                let r_cnt = try!(decode_component(&mut self.r, self.width, |x_off, value| { ret[y_off + x_off].r = value } ));
+                let g_cnt = try!(decode_component(&mut self.r, self.width, |x_off, value| { ret[y_off + x_off].g = value } ));
+                let b_cnt = try!(decode_component(&mut self.r, self.width, |x_off, value| { ret[y_off + x_off].b = value } ));
+                let e_cnt = try!(decode_component(&mut self.r, self.width, |x_off, value| { ret[y_off + x_off].e = value } ));
+                
+            } else {
+                // TODO:
+                unimplemented!();
+            }
+        }
+        unimplemented!()
+    }
+//    pub fn primaries(&self) -> ((f32, f32), (f32, f32), (f32, f32), (f32, f32)) {
+//        self.primaries
+//    }
+}
+
+impl<R> ImageDecoder for HDRDecoder<R> {
+    fn dimensions(&mut self) -> ImageResult<(u32, u32)> {
+        Ok((self.width, self.height))
+    }
+
+    fn colortype(&mut self) -> ImageResult<ColorType> {
+        Ok(ColorType::RGBE(8))
+    }
+
+    fn row_len(&mut self) -> ImageResult<usize> {
+        Ok(4*(self.width as usize))
+    }
+
+    fn read_scanline(&mut self, buf: &mut [u8]) -> ImageResult<u32> {
+        unimplemented!()
+    }
+
+    fn read_image(&mut self) -> ImageResult<DecodingResult> {
+        unimplemented!()
     }
 }
 
-// Parses dimension line "-Y height +X widht"
+#[inline(always)]
+fn read_byte<R: Read>(r: &mut R) -> io::Result<u8> {
+    let mut buf = [0u8];
+    try!(r.read_exact(&mut buf[..]));
+    Ok(buf[0])
+}
+
+// precondition: R must be positioned at offset 4 from the beginning of a scanline
+#[inline]
+fn decode_component<R: Read, S: FnMut(usize, u8)>(r: &mut R, width: u32, mut set_component: S) -> io::Result<usize> {
+    let mut buf = [0; 128];
+    let mut pos = 0;
+    while pos < width {
+        // increment position by a number of decomressed values
+        pos += {
+            let rl = try!(read_byte(r));
+            if rl <= 128 {
+                // read values
+                try!(r.read_exact(&mut buf[0..rl as usize]));
+                for (offset, &value) in buf[0..rl as usize].iter().enumerate() {
+                    set_component(pos as usize + offset, value);
+                };
+                rl as u32
+            } else {
+                // run
+                let rl = rl - 128;
+                let value = try!(read_byte(r));
+                for offset in 0..rl as usize {
+                    set_component(pos as usize + offset, value);
+                };
+                rl as u32
+            }
+        };
+    }
+    Ok(pos as usize)
+}
+
+fn read_rgbe<R: Read>(r: &mut R) -> io::Result<RGBE8Pixel> {
+    let mut buf = [0u8; 4];
+    try!(r.read_exact(&mut buf[..]));
+    // It's actually safe
+    Ok(unsafe{ ::std::mem::transmute(buf) })
+}
+
+#[derive(Debug)]
+struct HeaderInfo {
+    exposure: Option<f32>,
+    color_correction: Option<(f32,f32,f32)>,
+    software: Option<String>,
+    pixel_aspect_ratio: Option<f32>,
+    //primaries: Option<((f32, f32), (f32, f32), (f32, f32), (f32, f32))>,
+    gamma: Option<f32>,    
+}
+
+impl HeaderInfo {
+    fn new() -> HeaderInfo {
+        HeaderInfo {
+            exposure: None,
+            color_correction: None,
+            software: None,
+            pixel_aspect_ratio: None,
+            //primaries: None,
+            gamma: None,
+        }
+    }
+
+    // Updates header info, in strict mode returns error for malformed lines (no '=' separator)
+    // unknown attributes are skipped
+    fn update_header_info<'a>(&mut self, line: &Cow<'a, str>, strict: bool) -> ImageResult<()> {
+        // split line at first '=' and inspect results 
+        match split_at_first(&line, "=") {
+            Some(("FORMAT", val)) => {
+                if val.trim() != "32bit_rle_rgbe" {
+                    // XYZE isn't supported yet
+                    return Err(ImageError::UnsupportedError(val.into()));
+                }
+            },
+            Some(("EXPOSURE", val)) => {
+                match val.trim().parse::<f32>() {
+                    Ok(v) => {
+                        self.exposure = Some(self.exposure.unwrap_or(1.)*v); // all encountered exposure values should be multplied 
+                    },
+                    Err(parse_error) => {
+                        if strict {
+                            return Err(ImageError::FormatError(format!("Cannot parse EXPOSURE value: {}", parse_error.description())));
+                        } // no else, skip this line in non-strict mode
+                    },
+                };
+            },
+            Some(("PIXASPECT", val)) => {
+                match val.trim().parse::<f32>() {
+                    Ok(v) => {
+                        self.pixel_aspect_ratio = Some(self.pixel_aspect_ratio.unwrap_or(1.)*v); // all encountered exposure values should be multplied 
+                    },
+                    Err(parse_error) => {
+                        if strict {
+                            return Err(ImageError::FormatError(format!("Cannot parse PIXASPECT value: {}", parse_error.description())));
+                        } // no else, skip this line in non-strict mode
+                    },
+                };
+            },
+            Some(("GAMMA", val)) => {
+                match val.trim().parse::<f32>() {
+                    Ok(v) => {
+                        self.gamma = Some(v);  
+                    },
+                    Err(parse_error) => {
+                        if strict {
+                            return Err(ImageError::FormatError(format!("Cannot parse GAMMA value: {}", parse_error.description())));
+                        } // no else, skip this line in non-strict mode
+                    },
+                };
+            },
+            Some(("SOFTWARE", val)) => {
+                self.software = Some(val.into());
+            },
+            Some(("COLORCORR", val)) => {
+                let mut rgbcorr = [1., 1., 1.];
+                match parse_space_separated_f32(val, &mut rgbcorr, "COLORCORR") {
+                    Ok(extra_numbers) => {
+                        if strict && extra_numbers {
+                            return Err(ImageError::FormatError("Extra numbers in COLORCORR".into()));
+                        } // no else, just ignore extra numbers
+                        let (rc, gc, bc) = self.color_correction.unwrap_or((1., 1., 1.));
+                        self.color_correction = Some((rc*rgbcorr[0], gc*rgbcorr[1], bc*rgbcorr[2]));
+                    },
+                    Err(err) => {
+                        if strict {
+                            return Err(err);
+                        } // no else, skip malformed line in non-strict mode 
+                    },
+                }
+            },
+            None => {
+                if strict {
+                    // TODO: limit reported line length  
+                    return Err(ImageError::FormatError(format!("Malformed attribute '{}'", line)));
+                } else {
+                    // skip malformed attribute
+                }
+            },
+            _ => {
+                // skip unknown attribute
+            },
+        } // match attributes
+        Ok(())
+    }
+}
+
+fn parse_space_separated_f32(line: &str, vals: &mut [f32], name: &str) -> ImageResult<bool> {
+    let mut nums = line.split_whitespace();
+    for val in vals.iter_mut() {
+        if let Some(num) = nums.next() {
+            match num.parse::<f32>() {
+                Ok(v) => *val = v,
+                Err(err) => {
+                    return Err(ImageError::FormatError(format!("f32 parse error in {}: {}", name, err.description())));
+                }
+            }
+        } else {
+            // not enough numbers in line
+            return Err(ImageError::FormatError(format!("Not enough numbers in {}", name)));
+        }
+    }
+    Ok(nums.next().is_some())
+}
+
+// Parses dimension line "-Y height +X width"
 // returns (width, height) or error
 fn parse_dimensions_line<'a>(line: &Cow<'a, str>, strict: bool) -> ImageResult<(u32,u32)> {
     let mut dim_parts = line.split_whitespace();
