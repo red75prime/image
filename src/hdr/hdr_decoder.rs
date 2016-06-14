@@ -258,7 +258,7 @@ impl HeaderInfo {
         // split line at first '=' and inspect results 
         match split_at_first(&line, "=") {
             Some(("FORMAT", val)) => {
-                if val.trim() != "32bit-rle_rgbe" {
+                if val.trim() != "32-bit_rle_rgbe" {
                     // XYZE isn't supported yet
                     return Err(ImageError::UnsupportedError(val.into()));
                 }
