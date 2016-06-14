@@ -434,7 +434,6 @@ fn read_line_u8<R: Read + Seek>(r: &mut R) -> ::std::io::Result<Option<Vec<u8>>>
     loop {
         // read_byte uses Read::read_exact, so I don't need to bother about EINTR
         match read_byte(r) {
-            } // no else
             Ok(byte) => {
                 no_data = false;
                 // HDR format doesn't specify encoding of end-of-line
@@ -446,11 +445,11 @@ fn read_line_u8<R: Read + Seek>(r: &mut R) -> ::std::io::Result<Option<Vec<u8>>>
                 } // end of EOL processing
                 ret.push(byte);
             },
-            Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => {
+            Err(ref err) if err.kind() == io::ErrorKind::UnexpectedEof => {
                 // EOF
                 return if no_data { Ok(None) } else { Ok(Some(ret)) };
             },
-            Err(err) => Err(err), // report all other errors
+            Err(err) => return Err(err), // report all other errors
         }
     }
 }
