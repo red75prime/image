@@ -88,6 +88,6 @@ fn max_pixel_value(pixel_type: color::ColorType) -> u16 {
         Palette(n) => 2u16.pow(n as u32) - 1,
         GrayA(n)   => 2u16.pow(n as u32) - 1,
         RGBA(n)    => 2u16.pow(n as u32) - 1,
-        RGBE(n)    => unimplemented!(),
+        RGBE(_)    => unimplemented!(),
     }
 }
