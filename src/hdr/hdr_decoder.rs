@@ -145,17 +145,16 @@ impl<R: Read + Seek> HDRDecoder<R> {
                 let y_off = y * self.width as usize;
                 // ret[y_off + x_off] can panic
                 // TODO: bounds checking in decode_component
-                let r_cnt = try!(decode_component(&mut self.r, self.width, |x_off, value| { ret[y_off + x_off].r = value } ));
-                let g_cnt = try!(decode_component(&mut self.r, self.width, |x_off, value| { ret[y_off + x_off].g = value } ));
-                let b_cnt = try!(decode_component(&mut self.r, self.width, |x_off, value| { ret[y_off + x_off].b = value } ));
-                let e_cnt = try!(decode_component(&mut self.r, self.width, |x_off, value| { ret[y_off + x_off].e = value } ));
-                
+                try!(decode_component(&mut self.r, self.width, |x_off, value| { ret[y_off + x_off].r = value } ));
+                try!(decode_component(&mut self.r, self.width, |x_off, value| { ret[y_off + x_off].g = value } ));
+                try!(decode_component(&mut self.r, self.width, |x_off, value| { ret[y_off + x_off].b = value } ));
+                try!(decode_component(&mut self.r, self.width, |x_off, value| { ret[y_off + x_off].e = value } ));
             } else {
                 // TODO:
                 unimplemented!();
             }
         }
-        unimplemented!()
+        Ok(ret)
     }
 //    pub fn primaries(&self) -> ((f32, f32), (f32, f32), (f32, f32), (f32, f32)) {
 //        self.primaries
@@ -193,11 +192,11 @@ fn read_byte<R: Read>(r: &mut R) -> io::Result<u8> {
 
 // precondition: R must be positioned at offset 4 from the beginning of a scanline
 #[inline]
-fn decode_component<R: Read, S: FnMut(usize, u8)>(r: &mut R, width: u32, mut set_component: S) -> io::Result<usize> {
+fn decode_component<R: Read, S: FnMut(usize, u8)>(r: &mut R, width: u32, mut set_component: S) -> ImageResult<()> {
     let mut buf = [0; 128];
     let mut pos = 0;
     while pos < width {
-        // increment position by a number of decomressed values
+        // increment position by a number of decompressed values
         pos += {
             let rl = try!(read_byte(r));
             if rl <= 128 {
@@ -218,7 +217,10 @@ fn decode_component<R: Read, S: FnMut(usize, u8)>(r: &mut R, width: u32, mut set
             }
         };
     }
-    Ok(pos as usize)
+    if pos != width {
+        return Err(ImageError::FormatError("Wrong length of decoded scanline".into()));
+    }
+    Ok(())
 }
 
 fn read_rgbe<R: Read>(r: &mut R) -> io::Result<RGBE8Pixel> {
@@ -256,7 +258,7 @@ impl HeaderInfo {
         // split line at first '=' and inspect results 
         match split_at_first(&line, "=") {
             Some(("FORMAT", val)) => {
-                if val.trim() != "32bit_rle_rgbe" {
+                if val.trim() != "32bit-rle_rgbe" {
                     // XYZE isn't supported yet
                     return Err(ImageError::UnsupportedError(val.into()));
                 }
