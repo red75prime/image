@@ -39,14 +39,15 @@ pub struct RGBE8Pixel {
 
 impl<R: Read + Seek> HDRDecoder<R> {
 
-    /// Creates a new decoder that decodes from the stream ```r```
-    /// or returns error if it cannot parse a header
+    /// Reads Radiance HDR image header from stream ```r```
+    /// if the header is valid, creates HDRDecoder 
+    /// strict mode is disabled (all recoverable errors are ignored)
     pub fn new(reader: R) -> ImageResult<HDRDecoder<R>> {
         HDRDecoder::with_strictness(reader, false)
     }    
 
-    /// Creates a new decoder that decodes from the stream ```r```
-    /// or returns error if it cannot parse a header
+    /// Reads Radiance HDR image header from stream ```r```
+    /// if the header is valid, creates HDRDecoder 
     /// strict enables strict mode
     pub fn with_strictness(mut reader: R, strict: bool) -> ImageResult<HDRDecoder<R>> {  
         
@@ -430,22 +431,27 @@ fn read_line_u8<R: Read + Seek>(r: &mut R) -> ::std::io::Result<Option<Vec<u8>>>
     let mut ret = Vec::with_capacity(16);
     let mut no_data = true;
 
-    let byte_buf = &mut [0];
     loop {
-        let bytes_read = try!(r.read(byte_buf));
-        if bytes_read == 0 {
-            // EOF
-            return if no_data { Ok(None) } else { Ok(Some(ret)) };
-        } // no else
-        no_data = false;
-        // HDR format doesn't specify encoding of end-of-line
-        // C implementation uses fgets
-        // Let's assume it is '\n'
-        if byte_buf[0] == b'\n' {
-            // "\n" line ending
-            return Ok(Some(ret));
-        } // end of EOL processing
-        ret.push(byte_buf[0]);
+        // read_byte uses Read::read_exact, so I don't need to bother about EINTR
+        match read_byte(r) {
+            } // no else
+            Ok(byte) => {
+                no_data = false;
+                // HDR format doesn't specify encoding of end-of-line
+                // C implementation uses fgets
+                // Let's assume it is '\n'
+                if byte == b'\n' {
+                    // "\n" line ending
+                    return Ok(Some(ret));
+                } // end of EOL processing
+                ret.push(byte);
+            },
+            Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => {
+                // EOF
+                return if no_data { Ok(None) } else { Ok(Some(ret)) };
+            },
+            Err(err) => Err(err), // report all other errors
+        }
     }
 }
 
