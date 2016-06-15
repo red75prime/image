@@ -144,12 +144,12 @@ impl<R: Read + Seek> HDRDecoder<R> {
             if fb.r == 2 && fb.g == 2 && fb.b < 128 {
                 // denormalized pixel value (2,2,<128,_) indicates new per component RLE method
                 let y_off = y * self.width as usize;
-                // ret[y_off + x_off] can panic
-                // TODO: bounds checking in decode_component
-                try!(decode_component(&mut self.r, self.width, |x_off, value| { ret[y_off + x_off].r = value } ));
-                try!(decode_component(&mut self.r, self.width, |x_off, value| { ret[y_off + x_off].g = value } ));
-                try!(decode_component(&mut self.r, self.width, |x_off, value| { ret[y_off + x_off].b = value } ));
-                try!(decode_component(&mut self.r, self.width, |x_off, value| { ret[y_off + x_off].e = value } ));
+                // decode_component guaranties that x_off is within y_off .. y_off+self.width
+                // therefore we can skip bounds checking here
+                try!(decode_component(&mut self.r, y_off, self.width as usize, |off, value| unsafe { ret.get_unchecked_mut(off).r = value } ));
+                try!(decode_component(&mut self.r, y_off, self.width as usize, |off, value| unsafe { ret.get_unchecked_mut(off).g = value } ));
+                try!(decode_component(&mut self.r, y_off, self.width as usize, |off, value| unsafe { ret.get_unchecked_mut(off).b = value } ));
+                try!(decode_component(&mut self.r, y_off, self.width as usize, |off, value| unsafe { ret.get_unchecked_mut(off).e = value } ));
             } else {
                 // TODO:
                 unimplemented!();
@@ -192,33 +192,43 @@ fn read_byte<R: Read>(r: &mut R) -> io::Result<u8> {
 }
 
 // precondition: R must be positioned at offset 4 from the beginning of a scanline
+// Guaranties that first argument of set_component will be within pos .. pos+width
 #[inline]
-fn decode_component<R: Read, S: FnMut(usize, u8)>(r: &mut R, width: u32, mut set_component: S) -> ImageResult<()> {
+fn decode_component<R: Read, S: FnMut(usize, u8)>(r: &mut R, mut pos: usize, width: usize, mut set_component: S) -> ImageResult<()> {
     let mut buf = [0; 128];
-    let mut pos = 0;
-    while pos < width {
+    let mut bound = pos + width;
+    while pos < bound {
         // increment position by a number of decompressed values
         pos += {
             let rl = try!(read_byte(r));
             if rl <= 128 {
+                // sanity check
+                if pos + rl as usize > bound {
+                    return Err(ImageError::FormatError("Wrong length of decoded scanline".into()));
+                }
                 // read values
                 try!(r.read_exact(&mut buf[0..rl as usize]));
                 for (offset, &value) in buf[0..rl as usize].iter().enumerate() {
-                    set_component(pos as usize + offset, value);
+                    set_component(pos + offset, value);
                 };
-                rl as u32
+                rl as usize
             } else {
                 // run
                 let rl = rl - 128;
+                // sanity check
+                if pos + rl as usize > width as usize {
+                    return Err(ImageError::FormatError("Wrong length of decoded scanline".into()));
+                }
+                // fill with same value
                 let value = try!(read_byte(r));
                 for offset in 0..rl as usize {
                     set_component(pos as usize + offset, value);
                 };
-                rl as u32
+                rl as usize
             }
         };
     }
-    if pos != width {
+    if pos != bound {
         return Err(ImageError::FormatError("Wrong length of decoded scanline".into()));
     }
     Ok(())
@@ -432,7 +442,7 @@ fn read_line_u8<R: Read + Seek>(r: &mut R) -> ::std::io::Result<Option<Vec<u8>>>
     let mut no_data = true;
 
     loop {
-        // read_byte uses Read::read_exact, so I don't need to bother about EINTR
+        // read_byte uses Read::read_exact, so I don't need to bother myself about EINTR
         match read_byte(r) {
             Ok(byte) => {
                 no_data = false;
