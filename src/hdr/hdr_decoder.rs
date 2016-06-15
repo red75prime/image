@@ -17,6 +17,7 @@ static SIGNATURE: &'static [u8] = b"#?RADIANCE";
 const SIGNATURE_LENGTH: usize = 10;
 
 /// An Radiance HDR decoder
+#[derive(Debug)]
 pub struct HDRDecoder<R> {
     r: R,
 
@@ -26,7 +27,7 @@ pub struct HDRDecoder<R> {
     color_correction: (f32,f32,f32),
     software: String,
     pixel_aspect_ratio: f32,
-    //primaries: ((f32, f32), (f32, f32), (f32, f32), (f32, f32)),
+    custom_attributes: Vec<(String,String)>, // key, value
 }
 
 #[repr(C)] #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -41,14 +42,17 @@ impl<R: Read + Seek> HDRDecoder<R> {
 
     /// Reads Radiance HDR image header from stream ```r```
     /// if the header is valid, creates HDRDecoder 
-    /// strict mode is disabled (all recoverable errors are ignored)
+    /// strict mode is enabled
     pub fn new(reader: R) -> ImageResult<HDRDecoder<R>> {
-        HDRDecoder::with_strictness(reader, false)
+        HDRDecoder::with_strictness(reader, true)
     }    
 
     /// Reads Radiance HDR image header from stream ```r```
     /// if the header is valid, creates HDRDecoder 
     /// strict enables strict mode
+    /// Warning! Reading wrong file in non-strict mode
+    ///   could consume file size worth of memory in the process.
+    ///   Memory will be freed on decoder drop.
     pub fn with_strictness(mut reader: R, strict: bool) -> ImageResult<HDRDecoder<R>> {  
         
         let mut attributes = HeaderInfo::new();  
@@ -71,7 +75,7 @@ impl<R: Read + Seek> HDRDecoder<R> {
             loop {
                 match try!(read_line_u8(r)) {
                     None => { // EOF before end of header
-                        return Err(ImageError::NotEnoughData);
+                        return Err(ImageError::FormatError("EOF in header".into()));
                     },
                     Some(line) => {
                         if line.len() == 0 {
@@ -93,7 +97,7 @@ impl<R: Read + Seek> HDRDecoder<R> {
             match try!(read_line_u8(&mut reader)) {
                 None => {
                     // EOF instead of image dimensions
-                    return Err(ImageError::NotEnoughData);
+                    return Err(ImageError::FormatError("EOF in dimensions line".into()));
                 },
                 Some(dimensions) => {
                     let dimensions = String::from_utf8_lossy(&dimensions[..]);
@@ -110,7 +114,7 @@ impl<R: Read + Seek> HDRDecoder<R> {
             color_correction: attributes.color_correction.unwrap_or((1., 1., 1.)),
             software: attributes.software.unwrap_or("".into()),
             pixel_aspect_ratio: attributes.pixel_aspect_ratio.unwrap_or(1.),
-            //primaries: primaries,
+            custom_attributes: attributes.custom_attributes,
         })
     } // end with_strictness
 
@@ -135,8 +139,12 @@ impl<R: Read + Seek> HDRDecoder<R> {
         self.pixel_aspect_ratio
     }
 
-    /// Returns a vector of decompressed RGBE8 pixels
-    pub fn read_image_native(&mut self) -> ImageResult<Vec<RGBE8Pixel>> {
+    pub fn custom_attributes(&self) -> &[(String, String)] {
+        self.custom_attributes.as_slice()
+    }
+
+    /// Consumes decoder and returns a vector of decompressed RGBE8 pixels
+    pub fn read_image_native(mut self) -> ImageResult<Vec<RGBE8Pixel>> {
         // Don't read anything if image is empty 
         if self.width == 0 || self.height ==0 {
             return Ok(vec![]);
@@ -150,73 +158,11 @@ impl<R: Read + Seek> HDRDecoder<R> {
         } // ret contains uninitialized data, so now it's my responsibility to return fully initialized ret
         for y in 0 .. self.height as usize {
             // first 4 bytes in scanline allow to determine compression method
-            let fb = try!(read_rgbe(&mut self.r)); 
             let y_off = y * self.width as usize;
-            if fb.r == 2 && fb.g == 2 && fb.b < 128 {
-                // denormalized pixel value (2,2,<128,_) indicates new per component RLE method
-                // decode_component guaranties that x_off is within y_off .. y_off+self.width
-                // therefore we can skip bounds checking here
-                try!(decode_component(&mut self.r, y_off, self.width as usize, |off, value| unsafe { ret.get_unchecked_mut(off).r = value } ));
-                try!(decode_component(&mut self.r, y_off, self.width as usize, |off, value| unsafe { ret.get_unchecked_mut(off).g = value } ));
-                try!(decode_component(&mut self.r, y_off, self.width as usize, |off, value| unsafe { ret.get_unchecked_mut(off).b = value } ));
-                try!(decode_component(&mut self.r, y_off, self.width as usize, |off, value| unsafe { ret.get_unchecked_mut(off).e = value } ));
-            } else { // old RLE method (it was considered old around 1991, should it be here?)
-                // convenience function. 
-                // returns run length if pixel is a run length marker
-                #[inline]  
-                fn rl_marker(pix : RGBE8Pixel) -> Option<usize> {
-                    if pix.r == 1 && pix.g == 1 && pix.b == 1 {
-                        Some(pix.e as usize)
-                    } else {
-                        None
-                    }
-                }
-                // first pixel in scanline should not be run length marker
-                // it is error if it is
-                if let Some(_) = rl_marker(fb) {
-                    return Err(ImageError::FormatError("First pixel of a scanline shouldn't be run length marker".into()));
-                } 
-                ret[y_off] = fb; // set first pixel of scanline
-
-                let width = self.width as usize;                
-                let mut x_off = 1; // current offset from beginning of a scanline
-                let mut rl_mult = 1; // current run length multiplier
-                let mut prev_pixel = fb;
-                while x_off < width {
-                    let pix = try!(read_rgbe(&mut self.r));
-                    // it's harder to forget to increase x_off if I write this this way.
-                    x_off += {
-                        if let Some(rl) = rl_marker(pix) {
-                            // rl_mult takes care of consecutive RL markers
-                            let rl = rl * rl_mult; 
-                            rl_mult *= 256;
-                            if x_off + rl <= width {
-                                // do run
-                                for x in x_off .. x_off + rl {
-                                    ret[y_off + x] = prev_pixel;
-                                } 
-                            } else {
-                                return Err(ImageError::FormatError("Wrong length of decoded scanline".into()));
-                            };
-                            rl // value to increase x_off by
-                        } else {
-                            rl_mult = 1; // chain of consecutive RL markers is broken
-                            prev_pixel = pix;
-                            ret[y_off + x_off] = pix;
-                            1 // value to increase x_off by
-                        }
-                    };
-                }
-                if x_off != width {
-                    return Err(ImageError::FormatError("Wrong length of decoded scanline".into()));
-                }
-            }
+            try!(read_scanline(&mut self.r, &mut ret[y_off .. y_off + self.width as usize]));
         }
         Ok(ret)
     }
-//    pub fn primaries(&self) -> ((f32, f32), (f32, f32), (f32, f32), (f32, f32)) {
-//        self.primaries
-//    }
 }
 
 impl<R> ImageDecoder for HDRDecoder<R> {
@@ -241,6 +187,111 @@ impl<R> ImageDecoder for HDRDecoder<R> {
     }
 }
 
+impl<R: Read + Seek> IntoIterator for HDRDecoder<R> {
+    type Item = ImageResult<RGBE8Pixel>;
+    type IntoIter = HDRImageDecoderIterator<R>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        // scanline buffer
+        let mut buf = Vec::with_capacity(self.width as usize);
+        unsafe {
+            // dropping half-initialized vector of RGBE8Pixel is safe
+            // and I took care to hide half-initialized vector from a user
+            buf.set_len(self.width as usize);
+        }
+        HDRImageDecoderIterator {
+            r: self.r,
+            scanline_cnt: self.height as usize,
+            buf: buf,
+            col: 0,
+            scanline: 0,
+            error_encountered: false,
+        }
+    }
+}
+
+pub struct HDRImageDecoderIterator<R: Read> {
+    r: R,
+    scanline_cnt: usize,
+    buf: Vec<RGBE8Pixel>, // scanline buffer
+    col: usize, // current position in scanline
+    scanline: usize, // current scanline
+    error_encountered: bool,
+}
+
+impl<R: Read> HDRImageDecoderIterator<R> {
+    // Advances counter to the next pixel
+    #[inline]
+    fn advance(&mut self) {
+        self.col += 1;
+        if self.col == self.buf.len() {
+            self.col = 0;
+            self.scanline += 1;
+        }
+    }
+}
+
+impl<R: Read> Iterator for HDRImageDecoderIterator<R> {
+    type Item = ImageResult<RGBE8Pixel>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.buf.len() == 0 || self.scanline == self.scanline_cnt {
+            // No more pixels
+            return None;
+        } // no else
+        if self.error_encountered {
+            self.advance();
+            // Error was encountered. Keep producing errors.
+            // ImageError can't implement Clone, so just dump some error
+            return Some(Err(ImageError::ImageEnd));
+        } // no else
+        if self.col == 0 {
+            // fill scanline buffer
+            match read_scanline(&mut self.r, &mut self.buf[..]) {
+                Ok(_) => {},
+                Err(err) => {
+                    self.error_encountered = true;
+                    self.advance();
+                    return Some(Err(err));
+                }
+            }
+        } // no else
+        let ret = self.buf[self.col];
+        self.advance();
+        Some(Ok(ret))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let total_cnt = self.buf.len() * self.scanline_cnt;
+        let cur_cnt = self.buf.len() * self.scanline + self.col;
+        let remaining = total_cnt - cur_cnt;
+        (remaining, Some(remaining))
+    }
+}
+
+impl<R: Read> ExactSizeIterator for HDRImageDecoderIterator<R> {} 
+
+// Precondition: buf.len() > 0
+fn read_scanline<R: Read>(r: &mut R, buf: &mut [RGBE8Pixel]) -> ImageResult<()> {
+    assert!(buf.len()>0);
+    let width = buf.len();
+    // first 4 bytes in scanline allow to determine compression method
+    let fb = try!(read_rgbe(r)); 
+    if fb.r == 2 && fb.g == 2 && fb.b < 128 {
+        // denormalized pixel value (2,2,<128,_) indicates new per component RLE method
+        // decode_component guaranties that offset is within 0 .. width
+        // therefore we can skip bounds checking here, but we will not
+        try!(decode_component(r, width, |offset, value| buf[offset].r = value ));
+        try!(decode_component(r, width, |offset, value| buf[offset].g = value ));
+        try!(decode_component(r, width, |offset, value| buf[offset].b = value ));
+        try!(decode_component(r, width, |offset, value| buf[offset].e = value ));
+    } else { 
+        // old RLE method (it was considered old around 1991, should it be here?)
+        try!(decode_old_rle(r, fb, buf));
+    }
+    Ok(())
+}
+
 #[inline(always)]
 fn read_byte<R: Read>(r: &mut R) -> io::Result<u8> {
     let mut buf = [0u8];
@@ -248,19 +299,18 @@ fn read_byte<R: Read>(r: &mut R) -> io::Result<u8> {
     Ok(buf[0])
 }
 
-// precondition: R must be positioned at offset 4 from the beginning of a scanline
-// Guaranties that first argument of set_component will be within pos .. pos+width
+// Guaranties that first parameter of set_component will be within pos .. pos+width
 #[inline]
-fn decode_component<R: Read, S: FnMut(usize, u8)>(r: &mut R, mut pos: usize, width: usize, mut set_component: S) -> ImageResult<()> {
+fn decode_component<R: Read, S: FnMut(usize, u8)>(r: &mut R, width: usize, mut set_component: S) -> ImageResult<()> {
     let mut buf = [0; 128];
-    let bound = pos + width;
-    while pos < bound {
+    let mut pos = 0;
+    while pos < width {
         // increment position by a number of decompressed values
         pos += {
             let rl = try!(read_byte(r));
             if rl <= 128 {
                 // sanity check
-                if pos + rl as usize > bound {
+                if pos + rl as usize > width {
                     return Err(ImageError::FormatError("Wrong length of decoded scanline".into()));
                 }
                 // read values
@@ -273,7 +323,7 @@ fn decode_component<R: Read, S: FnMut(usize, u8)>(r: &mut R, mut pos: usize, wid
                 // run
                 let rl = rl - 128;
                 // sanity check
-                if pos + rl as usize > bound {
+                if pos + rl as usize > width {
                     return Err(ImageError::FormatError("Wrong length of decoded scanline".into()));
                 }
                 // fill with same value
@@ -285,7 +335,64 @@ fn decode_component<R: Read, S: FnMut(usize, u8)>(r: &mut R, mut pos: usize, wid
             }
         };
     }
-    if pos != bound {
+    if pos != width {
+        return Err(ImageError::FormatError("Wrong length of decoded scanline".into()));
+    }
+    Ok(())
+}
+
+// Decodes scanline, places it into buf
+// Precondition: buf.len() > 0
+// fb - first 4 bytes of scanline
+fn decode_old_rle<R: Read>(r: &mut R, fb: RGBE8Pixel, buf: &mut [RGBE8Pixel]) -> ImageResult<()> {
+    assert!(buf.len() > 0);
+    let width = buf.len();
+    // convenience function. 
+    // returns run length if pixel is a run length marker
+    #[inline]  
+    fn rl_marker(pix : RGBE8Pixel) -> Option<usize> {
+        if pix.r == 1 && pix.g == 1 && pix.b == 1 {
+            Some(pix.e as usize)
+        } else {
+            None
+        }
+    }
+    // first pixel in scanline should not be run length marker
+    // it is error if it is
+    if let Some(_) = rl_marker(fb) {
+        return Err(ImageError::FormatError("First pixel of a scanline shouldn't be run length marker".into()));
+    } 
+    buf[0] = fb; // set first pixel of scanline
+
+    let mut x_off = 1; // current offset from beginning of a scanline
+    let mut rl_mult = 1; // current run length multiplier
+    let mut prev_pixel = fb;
+    while x_off < width {
+        let pix = try!(read_rgbe(r));
+        // it's harder to forget to increase x_off if I write this this way.
+        x_off += {
+            if let Some(rl) = rl_marker(pix) {
+                // rl_mult takes care of consecutive RL markers
+                let rl = rl * rl_mult; 
+                rl_mult *= 256;
+                if x_off + rl <= width {
+                    // do run
+                    for x in x_off .. x_off + rl {
+                        buf[x] = prev_pixel;
+                    } 
+                } else {
+                    return Err(ImageError::FormatError("Wrong length of decoded scanline".into()));
+                };
+                rl // value to increase x_off by
+            } else {
+                rl_mult = 1; // chain of consecutive RL markers is broken
+                prev_pixel = pix;
+                buf[x_off] = pix;
+                1 // value to increase x_off by
+            }
+        };
+    }
+    if x_off != width {
         return Err(ImageError::FormatError("Wrong length of decoded scanline".into()));
     }
     Ok(())
@@ -294,7 +401,7 @@ fn decode_component<R: Read, S: FnMut(usize, u8)>(r: &mut R, mut pos: usize, wid
 fn read_rgbe<R: Read>(r: &mut R) -> io::Result<RGBE8Pixel> {
     let mut buf = [0u8; 4];
     try!(r.read_exact(&mut buf[..]));
-    // It's actually safe
+    // It's actually safe: RGBE8Pixel is repr(C) and it doesn't implement Drop
     Ok(unsafe{ ::std::mem::transmute(buf) })
 }
 
@@ -305,7 +412,8 @@ struct HeaderInfo {
     software: Option<String>,
     pixel_aspect_ratio: Option<f32>,
     //primaries: Option<((f32, f32), (f32, f32), (f32, f32), (f32, f32))>,
-    gamma: Option<f32>,    
+    gamma: Option<f32>,
+    custom_attributes: Vec<(String, String)>,    
 }
 
 impl HeaderInfo {
@@ -317,19 +425,27 @@ impl HeaderInfo {
             pixel_aspect_ratio: None,
             //primaries: None,
             gamma: None,
+            custom_attributes: vec![],
         }
     }
 
     // Updates header info, in strict mode returns error for malformed lines (no '=' separator)
     // unknown attributes are skipped
     fn update_header_info<'a>(&mut self, line: &Cow<'a, str>, strict: bool) -> ImageResult<()> {
-        // split line at first '=' and inspect results 
-        // old Radiance HDR files (*.pic) feature tabs in key, so vvv trim
-        match split_at_first(&line, "=").map(|(key, value)| (key.trim(), value)) {
+        // split line at first '=' 
+        // old Radiance HDR files (*.pic) feature tabs in key, so                vvv trim
+        let maybe_key_value = split_at_first(&line, "=").map(|(key, value)| (key.trim(), value));
+        // save all header lines in custom_attributes
+        match maybe_key_value {
+            Some((key, val)) => self.custom_attributes.push((key.to_owned(), val.to_owned())),
+            None             => self.custom_attributes.push(("".into(), line.clone().into_owned())),
+        }
+        // parse known attributes
+        match maybe_key_value {
             Some(("FORMAT", val)) => {
                 if val.trim() != "32-bit_rle_rgbe" {
                     // XYZE isn't supported yet
-                    return Err(ImageError::UnsupportedError(val.into()));
+                    return Err(ImageError::UnsupportedError(limit_string_len(val, 20)));
                 }
             },
             Some(("EXPOSURE", val)) => {
@@ -438,13 +554,16 @@ fn parse_dimensions_line<'a>(line: &Cow<'a, str>, strict: bool) -> ImageResult<(
     match (c1_tag, c2_tag) {
         ("-Y", "+X") => {
             // Common orientation (top-down, left-right)
-            // c1_str is heigth, c2_str is width
+            // c1_str is height, c2_str is width
             let height = try!(c1_str.parse::<u32>().into_image_error(err));
             let width = try!(c2_str.parse::<u32>().into_image_error(err));
             Ok((width, height))
         },
         _ => {
-            Err(ImageError::UnsupportedError(format!("Unsupported orientation {} {}", c1_tag, c2_tag)))
+            Err(ImageError::FormatError(
+                    format!("Unsupported orientation {} {}", 
+                        limit_string_len(c1_tag, 4), 
+                        limit_string_len(c2_tag, 4))))
         }
     } // final expression. Returns value 
 }
@@ -462,6 +581,17 @@ impl<T> IntoImageError<T> for ::std::result::Result<T, ::std::num::ParseFloatErr
 impl<T> IntoImageError<T> for ::std::result::Result<T, ::std::num::ParseIntError> {
     fn into_image_error(self, description: &str) -> ImageResult<T> {
         self.map_err(|err| ImageError::FormatError(format!("{} {}", description, err.description())))
+    }
+}
+
+
+// Returns string with no more than len+3 characters
+fn limit_string_len(s: &str, len: usize) -> String {
+    let s_char_len = s.chars().count();
+    if s_char_len > len {
+        s.chars().take(len).chain("...".chars()).collect()
+    } else {
+        s.into()
     }
 }
 
