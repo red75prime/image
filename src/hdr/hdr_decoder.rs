@@ -216,13 +216,13 @@ fn decode_component<R: Read, S: FnMut(usize, u8)>(r: &mut R, mut pos: usize, wid
                 // run
                 let rl = rl - 128;
                 // sanity check
-                if pos + rl as usize > width as usize {
+                if pos + rl as usize > bound {
                     return Err(ImageError::FormatError("Wrong length of decoded scanline".into()));
                 }
                 // fill with same value
                 let value = try!(read_byte(r));
                 for offset in 0..rl as usize {
-                    set_component(pos as usize + offset, value);
+                    set_component(pos + offset, value);
                 };
                 rl as usize
             }
