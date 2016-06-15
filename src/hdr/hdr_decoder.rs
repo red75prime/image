@@ -196,7 +196,7 @@ fn read_byte<R: Read>(r: &mut R) -> io::Result<u8> {
 #[inline]
 fn decode_component<R: Read, S: FnMut(usize, u8)>(r: &mut R, mut pos: usize, width: usize, mut set_component: S) -> ImageResult<()> {
     let mut buf = [0; 128];
-    let mut bound = pos + width;
+    let bound = pos + width;
     while pos < bound {
         // increment position by a number of decompressed values
         pos += {
