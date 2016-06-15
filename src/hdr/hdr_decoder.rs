@@ -1,17 +1,37 @@
 use std::borrow::Cow;
 use std::error::Error;
-use std::io::{Read, Seek, SeekFrom, self};
-use std::iter::{Iterator, repeat, Rev};
-use std::slice::ChunksMut;
-use byteorder::{ReadBytesExt, LittleEndian};
+use std::io::{Read, Seek, self};
+use std::iter::{Iterator};
 
+use color::ColorType;
 use image::{
     DecodingResult,
-    ImageResult,
     ImageDecoder,
-    ImageError
+    ImageError,
+    ImageResult,
 };
-use color::ColorType;
+
+impl<R: Read + Seek> ImageDecoder for HDRDecoder<R> {
+    fn dimensions(&mut self) -> ImageResult<(u32, u32)> {
+        Ok((self.width, self.height))
+    }
+
+    fn colortype(&mut self) -> ImageResult<ColorType> {
+        Ok(ColorType::RGBE(8))
+    }
+
+    fn row_len(&mut self) -> ImageResult<usize> {
+        Ok(4*(self.width as usize))
+    }
+
+    fn read_scanline(&mut self, buf: &mut [u8]) -> ImageResult<u32> {
+        unimplemented!()
+    }
+
+    fn read_image(&mut self) -> ImageResult<DecodingResult> {
+        unimplemented!()
+    }
+}
 
 static SIGNATURE: &'static [u8] = b"#?RADIANCE";
 const SIGNATURE_LENGTH: usize = 10;
@@ -30,11 +50,16 @@ pub struct HDRDecoder<R> {
     custom_attributes: Vec<(String,String)>, // key, value
 }
 
+/// Refer to [wikipedia](https://en.wikipedia.org/wiki/RGBE_image_format)
 #[repr(C)] #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RGBE8Pixel {
+    /// Red mantissa
     pub r: u8,
+    /// Green mantissa
     pub g: u8,
+    /// Blue mantissa
     pub b: u8,
+    /// Colorless exponent
     pub e: u8,
 }
 
@@ -139,6 +164,8 @@ impl<R: Read + Seek> HDRDecoder<R> {
         self.pixel_aspect_ratio
     }
 
+    /// All lines from image header in (key, value) format
+    /// Comments and commands have empty string for a key
     pub fn custom_attributes(&self) -> &[(String, String)] {
         self.custom_attributes.as_slice()
     }
@@ -165,28 +192,6 @@ impl<R: Read + Seek> HDRDecoder<R> {
     }
 }
 
-impl<R> ImageDecoder for HDRDecoder<R> {
-    fn dimensions(&mut self) -> ImageResult<(u32, u32)> {
-        Ok((self.width, self.height))
-    }
-
-    fn colortype(&mut self) -> ImageResult<ColorType> {
-        Ok(ColorType::RGBE(8))
-    }
-
-    fn row_len(&mut self) -> ImageResult<usize> {
-        Ok(4*(self.width as usize))
-    }
-
-    fn read_scanline(&mut self, buf: &mut [u8]) -> ImageResult<u32> {
-        unimplemented!()
-    }
-
-    fn read_image(&mut self) -> ImageResult<DecodingResult> {
-        unimplemented!()
-    }
-}
-
 impl<R: Read + Seek> IntoIterator for HDRDecoder<R> {
     type Item = ImageResult<RGBE8Pixel>;
     type IntoIter = HDRImageDecoderIterator<R>;
@@ -210,6 +215,7 @@ impl<R: Read + Seek> IntoIterator for HDRDecoder<R> {
     }
 }
 
+/// Scanline buffered pixel by pixel iterator
 pub struct HDRImageDecoderIterator<R: Read> {
     r: R,
     scanline_cnt: usize,
