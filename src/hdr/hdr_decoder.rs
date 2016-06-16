@@ -63,8 +63,6 @@ impl RGBE8Pixel {
         if self.e == 0 {
             Rgb([0., 0., 0.])
         } else {
-            let exp = f32::exp2(self.e as f32 - 128. - 8.);
-            Rgb([exp*(self.r as f32 + 0.5), exp*(self.g as f32 + 0.5), exp*(self.b as f32 + 0.5)])
 //            let exp = f32::ldexp(1., self.e as isize - (128 + 8)); // unstable
             let exp = f32::exp2(self.e as f32 - (128. + 8.));
             Rgb([exp*(self.r as f32), exp*(self.g as f32), exp*(self.b as f32)])
