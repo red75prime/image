@@ -24,7 +24,7 @@ impl<R: Read + Seek> ImageDecoder for HDRDecoder<R> {
         Ok(3*4*(self.width as usize)) // 3 4-byte floats
     }
 
-    fn read_scanline(&mut self, buf: &mut [u8]) -> ImageResult<u32> {
+    fn read_scanline(&mut self, _: &mut [u8]) -> ImageResult<u32> {
         unimplemented!()
     }
 
@@ -227,6 +227,7 @@ impl<R: Read + Seek> IntoIterator for HDRDecoder<R> {
             buf: buf,
             col: 0,
             scanline: 0,
+            trouble: self.width == 0, // make `next()` check conditions
             error_encountered: false,
         }
     }
@@ -239,10 +240,12 @@ pub struct HDRImageDecoderIterator<R: Read> {
     buf: Vec<RGBE8Pixel>, // scanline buffer
     col: usize, // current position in scanline
     scanline: usize, // current scanline
+    trouble: bool, // optimization, true indicates that we need to check something
     error_encountered: bool,
 }
 
 impl<R: Read> HDRImageDecoderIterator<R> {
+
     // Advances counter to the next pixel
     #[inline]
     fn advance(&mut self) {
@@ -250,6 +253,7 @@ impl<R: Read> HDRImageDecoderIterator<R> {
         if self.col == self.buf.len() {
             self.col = 0;
             self.scanline += 1;
+            self.trouble = true;
         }
     }
 }
@@ -258,30 +262,41 @@ impl<R: Read> Iterator for HDRImageDecoderIterator<R> {
     type Item = ImageResult<RGBE8Pixel>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.buf.len() == 0 || self.scanline == self.scanline_cnt {
-            // No more pixels
-            return None;
-        } // no else
-        if self.error_encountered {
+        if !self.trouble {
+            let ret = self.buf[self.col];
             self.advance();
-            // Error was encountered. Keep producing errors.
-            // ImageError can't implement Clone, so just dump some error
-            return Some(Err(ImageError::ImageEnd));
-        } // no else
-        if self.col == 0 {
-            // fill scanline buffer
-            match read_scanline(&mut self.r, &mut self.buf[..]) {
-                Ok(_) => {},
-                Err(err) => {
-                    self.error_encountered = true;
-                    self.advance();
-                    return Some(Err(err));
+            Some(Ok(ret))
+        } else { 
+            // some condition is pending
+            if self.buf.len() == 0 || self.scanline == self.scanline_cnt {
+                // No more pixels
+                return None;
+            } // no else
+            if self.error_encountered {
+                self.advance();
+                // Error was encountered. Keep producing errors.
+                // ImageError can't implement Clone, so just dump some error
+                return Some(Err(ImageError::ImageEnd));
+            } // no else
+            if self.col == 0 {
+                // fill scanline buffer
+                match read_scanline(&mut self.r, &mut self.buf[..]) {
+                    Ok(_) => {
+                        // no action required
+                    },
+                    Err(err) => {
+                        self.advance();
+                        self.error_encountered = true;
+                        self.trouble = true;
+                        return Some(Err(err));
+                    }
                 }
-            }
-        } // no else
-        let ret = self.buf[self.col];
-        self.advance();
-        Some(Ok(ret))
+            } // no else
+            self.trouble = false;
+            let ret = self.buf[0];
+            self.advance();
+            Some(Ok(ret))
+        }
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
