@@ -3,7 +3,7 @@ use std::error::Error;
 use std::io::{Read, Seek, self};
 use std::iter::{Iterator};
 
-use color::ColorType;
+use color::{ColorType, Rgb};
 use image::{
     DecodingResult,
     ImageDecoder,
@@ -17,11 +17,11 @@ impl<R: Read + Seek> ImageDecoder for HDRDecoder<R> {
     }
 
     fn colortype(&mut self) -> ImageResult<ColorType> {
-        Ok(ColorType::RGBE(8))
+        Ok(ColorType::RGB(32))
     }
 
     fn row_len(&mut self) -> ImageResult<usize> {
-        Ok(4*(self.width as usize))
+        Ok(3*4*(self.width as usize)) // 3 4-byte floats
     }
 
     fn read_scanline(&mut self, buf: &mut [u8]) -> ImageResult<u32> {
@@ -40,14 +40,9 @@ const SIGNATURE_LENGTH: usize = 10;
 #[derive(Debug)]
 pub struct HDRDecoder<R> {
     r: R,
-
     width: u32,
     height: u32,
-    exposure: f32,
-    color_correction: (f32,f32,f32),
-    software: String,
-    pixel_aspect_ratio: f32,
-    custom_attributes: Vec<(String,String)>, // key, value
+    meta: HDRMetadata,
 }
 
 /// Refer to [wikipedia](https://en.wikipedia.org/wiki/RGBE_image_format)
@@ -63,6 +58,17 @@ pub struct RGBE8Pixel {
     pub e: u8,
 }
 
+impl RGBE8Pixel {
+    pub fn to_rgb(self) -> Rgb<f32> {
+        if self.e == 0 {
+            Rgb([0., 0., 0.])
+        } else {
+            let exp = f32::exp2(self.e as f32 - 128. - 8.);
+            Rgb([exp*(self.r as f32 + 0.5), exp*(self.g as f32 + 0.5), exp*(self.b as f32 + 0.5)])
+        }
+    }
+}
+
 impl<R: Read + Seek> HDRDecoder<R> {
 
     /// Reads Radiance HDR image header from stream ```r```
@@ -72,15 +78,16 @@ impl<R: Read + Seek> HDRDecoder<R> {
         HDRDecoder::with_strictness(reader, true)
     }    
 
-    /// Reads Radiance HDR image header from stream ```r```
-    /// if the header is valid, creates HDRDecoder 
+    /// Reads Radiance HDR image header from stream ```reader```,
+    /// if the header is valid, creates ```HDRDecoder```.
+    ///
     /// strict enables strict mode
+    ///
     /// Warning! Reading wrong file in non-strict mode
     ///   could consume file size worth of memory in the process.
-    ///   Memory will be freed on decoder drop.
     pub fn with_strictness(mut reader: R, strict: bool) -> ImageResult<HDRDecoder<R>> {  
         
-        let mut attributes = HeaderInfo::new();  
+        let mut attributes = HDRMetadata::new();  
 
         { // scope to make borrowck happy
             let r = &mut reader;
@@ -135,39 +142,16 @@ impl<R: Read + Seek> HDRDecoder<R> {
 
             width: width,
             height: height,
-            exposure: attributes.exposure.unwrap_or(1.),
-            color_correction: attributes.color_correction.unwrap_or((1., 1., 1.)),
-            software: attributes.software.unwrap_or("".into()),
-            pixel_aspect_ratio: attributes.pixel_aspect_ratio.unwrap_or(1.),
-            custom_attributes: attributes.custom_attributes,
+            meta: HDRMetadata {
+                width: width,
+                height: height,
+                ..attributes
+            }
         })
     } // end with_strictness
 
-    /// Values of pixels should be divided by this to get physical radiance in watts/steradian/m^2
-    pub fn exposure(&self) -> f32 {
-        self.exposure
-    } 
-
-    /// Correction for R, G, B channels. Pixel color values should be divided by corresponing value
-    pub fn color_correction(&self) -> (f32, f32, f32) {
-        self.color_correction
-    }
-
-    /// Software used to create the picture
-    /// Not useful. All hdr files I've seen use comments to indentify software
-    pub fn software(&self) -> &String {
-        &self.software
-    }
-
-    /// Height of pixel divided by width
-    pub fn pixel_aspect_ratio(&self) -> f32 {
-        self.pixel_aspect_ratio
-    }
-
-    /// All lines from image header in (key, value) format
-    /// Comments and commands have empty string for a key
-    pub fn custom_attributes(&self) -> &[(String, String)] {
-        self.custom_attributes.as_slice()
+    pub fn metadata(&self) -> HDRMetadata {
+        self.meta.clone()
     }
 
     /// Consumes decoder and returns a vector of decompressed RGBE8 pixels
@@ -411,26 +395,41 @@ fn read_rgbe<R: Read>(r: &mut R) -> io::Result<RGBE8Pixel> {
     Ok(unsafe{ ::std::mem::transmute(buf) })
 }
 
-#[derive(Debug)]
-struct HeaderInfo {
-    exposure: Option<f32>,
-    color_correction: Option<(f32,f32,f32)>,
-    software: Option<String>,
-    pixel_aspect_ratio: Option<f32>,
-    //primaries: Option<((f32, f32), (f32, f32), (f32, f32), (f32, f32))>,
-    gamma: Option<f32>,
-    custom_attributes: Vec<(String, String)>,    
+/// Metadata for Radiance HDR image
+#[derive(Debug, Clone)]
+pub struct HDRMetadata {
+    /// Width of decoded image. It could be either scanline length, 
+    /// or scanline count, depending on image orientation. 
+    pub width: u32,
+    /// Height of decoded image. It depends on orientation too.
+    pub height: u32,
+    /// Orientation matrix. For standart orientation it is ((1,0),(0,1)) - left to right, top to bottom.
+    /// First pair tells how resulting pixel coordinates change along a scanline.
+    /// Second pair tells how they change from one scanline to the next.
+    pub orientation: ((i8, i8), (i8, i8)), 
+    /// Divide color values by exposure to get to get physical radiance in watts/steradian/m^2
+    /// Image may not contain physical data, even if this field is set. 
+    pub exposure: Option<f32>,
+    /// Divide color values by corresponing tuple member (r, g, b) to get to get physical radiance in watts/steradian/m^2
+    /// Image may not contain physical data, even if this field is set. 
+    pub color_correction: Option<(f32,f32,f32)>,
+    /// Pixel height divided by pixel width
+    pub pixel_aspect_ratio: Option<f32>,
+    /// All lines contained in image header are put here. Ordering of lines is preserved.
+    /// Lines in the form "key=value" are represented as ("key", "value").
+    /// All other lines are ("", "line")
+    pub custom_attributes: Vec<(String, String)>,    
 }
 
-impl HeaderInfo {
-    fn new() -> HeaderInfo {
-        HeaderInfo {
+impl HDRMetadata {
+    fn new() -> HDRMetadata {
+        HDRMetadata {
+            width: 0,
+            height: 0,
+            orientation: ((1,0),(0,1)),
             exposure: None,
             color_correction: None,
-            software: None,
             pixel_aspect_ratio: None,
-            //primaries: None,
-            gamma: None,
             custom_attributes: vec![],
         }
     }
@@ -478,21 +477,6 @@ impl HeaderInfo {
                     },
                 };
             },
-            Some(("GAMMA", val)) => {
-                match val.trim().parse::<f32>() {
-                    Ok(v) => {
-                        self.gamma = Some(v);  
-                    },
-                    Err(parse_error) => {
-                        if strict {
-                            return Err(ImageError::FormatError(format!("Cannot parse GAMMA value: {}", parse_error.description())));
-                        } // no else, skip this line in non-strict mode
-                    },
-                };
-            },
-            Some(("SOFTWARE", val)) => {
-                self.software = Some(val.into());
-            },
             Some(("COLORCORR", val)) => {
                 let mut rgbcorr = [1., 1., 1.];
                 match parse_space_separated_f32(val, &mut rgbcorr, "COLORCORR") {
@@ -511,8 +495,8 @@ impl HeaderInfo {
                 }
             },
             None => {
-                    // skip malformed attribute
                     // old Radiance HDR files (*.pic) contain commands in a header
+                    // just skip them
             },
             _ => {
                 // skip unknown attribute
@@ -559,7 +543,7 @@ fn parse_dimensions_line<'a>(line: &Cow<'a, str>, strict: bool) -> ImageResult<(
     // There are 8 possible orientations: +Y +X, +X -Y and so on
     match (c1_tag, c2_tag) {
         ("-Y", "+X") => {
-            // Common orientation (top-down, left-right)
+            // Common orientation (left-right, top-down)
             // c1_str is height, c2_str is width
             let height = try!(c1_str.parse::<u32>().into_image_error(err));
             let width = try!(c2_str.parse::<u32>().into_image_error(err));
