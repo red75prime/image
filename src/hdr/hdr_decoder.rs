@@ -155,7 +155,7 @@ impl<R: Read + Seek> HDRDecoder<R> {
         self.meta.clone()
     }
 
-    /// Consumes decoder and returns a vector of decompressed RGBE8 pixels
+    /// Consumes decoder and returns a vector of RGBE8 pixels
     pub fn read_image_native(mut self) -> ImageResult<Vec<RGBE8Pixel>> {
         // Don't read anything if image is empty 
         if self.width == 0 || self.height ==0 {
@@ -175,6 +175,38 @@ impl<R: Read + Seek> HDRDecoder<R> {
         }
         Ok(ret)
     }
+
+    /// Consumes decoder and returns a vector of Rgb<f32> pixels
+    pub fn read_image_rgb(mut self) -> ImageResult<Vec<Rgb<f32>>> {
+        // Don't read anything if image is empty 
+        if self.width == 0 || self.height ==0 {
+            return Ok(vec![]);
+        }
+        // expression self.width > 0 && self.height > 0 is true from now to the end of this method
+        // scanline buffer
+        let uszwidth = self.width as usize;
+        let mut buf = Vec::<RGBE8Pixel>::with_capacity(uszwidth);
+        unsafe {
+            buf.set_len(uszwidth)
+        }
+
+        let pixel_count = self.width as usize * self.height as usize;
+        let mut ret = Vec::<Rgb<f32>>::with_capacity(pixel_count);
+        unsafe {
+            // RGBE8Pixel doesn't implement Drop, so it's Ok to drop half-initialized ret
+            ret.set_len(pixel_count);
+        } // ret contains uninitialized data, so now it's my responsibility to return fully initialized ret
+        for y in 0 .. self.height as usize {
+            // first 4 bytes in scanline allow to determine compression method
+            let y_off = y * self.width as usize;
+            try!(read_scanline(&mut self.r, &mut buf[..]));
+            for (x, pix) in buf.iter().enumerate() {
+                ret[y_off + x] = pix.to_rgb();
+            }
+        }
+        Ok(ret)
+    }
+
 }
 
 impl<R: Read + Seek> IntoIterator for HDRDecoder<R> {
