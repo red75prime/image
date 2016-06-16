@@ -4,7 +4,7 @@
 //!
 //!  # Related Links
 //!  * http://radsite.lbl.gov/radiance/refer/filefmts.pdf
-//!  * http://www.cs.virginia.edu/~jcw5q/apps/imageview/src/libimageviewer/hdr.c
+//!  * http://www.graphics.cornell.edu/~bjw/rgbe/rgbe.c
 //!
 
 mod hdr_decoder;
