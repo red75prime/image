@@ -1,6 +1,9 @@
+use Primitive;
+use num_traits::cast::NumCast;
+use num_traits::identities::Zero;
 use std::borrow::Cow;
 use std::error::Error;
-use std::io::{Read, Seek, self};
+use std::io::{Read, self};
 use std::iter::{Iterator};
 
 use color::{ColorType, Rgb};
@@ -11,17 +14,35 @@ use image::{
     ImageResult,
 };
 
-impl<R: Read + Seek> ImageDecoder for HDRDecoder<R> {
+/// Adapter to conform to ```ImageDecoder``` trait
+#[derive(Debug)]
+pub struct HDRAdapter<R: Read> {
+    inner: Option<HDRDecoder<R>>,
+    meta: HDRMetadata,
+}
+
+impl<R: Read> HDRAdapter<R> {
+    pub fn new(r: R) -> ImageResult<HDRAdapter<R>> {
+        let decoder = try!(HDRDecoder::new(r));
+        let meta = decoder.metadata();
+        Ok(HDRAdapter{ 
+            inner: Some(decoder), 
+            meta: meta,
+        })
+    }
+}
+
+impl<R: Read> ImageDecoder for HDRAdapter<R> {
     fn dimensions(&mut self) -> ImageResult<(u32, u32)> {
-        Ok((self.width, self.height))
+        Ok((self.meta.width, self.meta.height))
     }
 
     fn colortype(&mut self) -> ImageResult<ColorType> {
-        Ok(ColorType::RGB(32))
+        Ok(ColorType::RGB(8))
     }
 
     fn row_len(&mut self) -> ImageResult<usize> {
-        Ok(3*4*(self.width as usize)) // 3 4-byte floats
+        Ok(3*(self.meta.width as usize)) // 3 4-byte floats
     }
 
     fn read_scanline(&mut self, _: &mut [u8]) -> ImageResult<u32> {
@@ -29,11 +50,29 @@ impl<R: Read + Seek> ImageDecoder for HDRDecoder<R> {
     }
 
     fn read_image(&mut self) -> ImageResult<DecodingResult> {
-        unimplemented!()
+        match self.inner.take() {
+            Some(decoder) => {
+                let elem_len = ::std::mem::size_of::<Rgb<u8>>();
+                let mut img: Vec<Rgb<u8>> = try!(decoder.read_image_ldr());
+                // let's transform Vec<Rgb<u8>> into Vec<u8>
+                let p = img.as_mut_ptr() as *mut u8;
+                let len = img.len()*elem_len; // length in bytes
+                let cap = img.capacity()*elem_len; // 
+
+                unsafe {
+                    ::std::mem::forget(img);
+                    Ok(DecodingResult::U8(Vec::from_raw_parts(p, len, cap)))
+                }
+                
+            },
+            None => {
+                Err(ImageError::ImageEnd)
+            }
+        }
     }
 }
 
-static SIGNATURE: &'static [u8] = b"#?RADIANCE";
+pub const SIGNATURE: &'static [u8] = b"#?RADIANCE";
 const SIGNATURE_LENGTH: usize = 10;
 
 /// An Radiance HDR decoder
@@ -58,8 +97,13 @@ pub struct RGBE8Pixel {
     pub e: u8,
 }
 
+pub fn rgbe8(r: u8, g: u8, b: u8, e: u8) -> RGBE8Pixel {
+    RGBE8Pixel { r: r, g: g, b: b, e: e }
+}
+
 impl RGBE8Pixel {
-    pub fn to_rgb(self) -> Rgb<f32> {
+    #[inline]
+    pub fn to_hdr(self) -> Rgb<f32> {
         if self.e == 0 {
             Rgb([0., 0., 0.])
         } else {
@@ -68,9 +112,36 @@ impl RGBE8Pixel {
             Rgb([exp*(self.r as f32), exp*(self.g as f32), exp*(self.b as f32)])
         }
     }
+
+    #[inline]
+    pub fn to_ldr<T: Primitive + Zero>(self) -> Rgb<T> {
+        self.to_ldr_scale_gamma(1.0, 2.2)
+    }
+
+    #[inline]
+    pub fn to_ldr_scale_gamma<T: Primitive + Zero>(self, scale: f32, gamma: f32) -> Rgb<T> {
+        let Rgb{data} = self.to_hdr();
+        let (r, g, b) = (data[0], data[1], data[2]);
+        #[inline] fn sg<T: Primitive + Zero>(v: f32, scale: f32, gamma: f32) -> T { 
+            let t_max = T::max_value();
+            // Disassembly shows that t_max_f32 is compiled into constant
+            let t_max_f32: f32 = NumCast::from(t_max).expect("to_ldr_scale_gamma: maximum value of type is not representable as f32");
+            let fv = f32::powf(v * scale, gamma) * t_max_f32 + 0.5;
+            if fv < 0. {
+                T::zero()
+            } else if fv > t_max_f32 {
+                t_max
+            } else {
+                NumCast::from(fv).expect("to_ldr_scale_gamma: cannot convert f32 to target type. NaN?")
+            }
+        }
+        // TODO: use huon's simd
+        Rgb([sg(r, scale, gamma), sg(g, scale, gamma), sg(b, scale, gamma)])
+    }
+
 }
 
-impl<R: Read + Seek> HDRDecoder<R> {
+impl<R: Read> HDRDecoder<R> {
 
     /// Reads Radiance HDR image header from stream ```r```
     /// if the header is valid, creates HDRDecoder 
@@ -176,8 +247,8 @@ impl<R: Read + Seek> HDRDecoder<R> {
         Ok(ret)
     }
 
-    /// Consumes decoder and returns a vector of Rgb<f32> pixels
-    pub fn read_image_rgb(mut self) -> ImageResult<Vec<Rgb<f32>>> {
+    /// Consumes decoder and returns a vector of tranformed pixels
+    pub fn read_image_transform<T, F: Fn(RGBE8Pixel)-> T>(mut self, f: F) -> ImageResult<Vec<T>> {
         // Don't read anything if image is empty 
         if self.width == 0 || self.height ==0 {
             return Ok(vec![]);
@@ -191,7 +262,7 @@ impl<R: Read + Seek> HDRDecoder<R> {
         }
 
         let pixel_count = self.width as usize * self.height as usize;
-        let mut ret = Vec::<Rgb<f32>>::with_capacity(pixel_count);
+        let mut ret = Vec::with_capacity(pixel_count);
         unsafe {
             // RGBE8Pixel doesn't implement Drop, so it's Ok to drop half-initialized ret
             ret.set_len(pixel_count);
@@ -200,16 +271,28 @@ impl<R: Read + Seek> HDRDecoder<R> {
             // first 4 bytes in scanline allow to determine compression method
             let y_off = y * self.width as usize;
             try!(read_scanline(&mut self.r, &mut buf[..]));
-            for (x, pix) in buf.iter().enumerate() {
-                ret[y_off + x] = pix.to_rgb();
+            for (x, &pix) in buf.iter().enumerate() {
+                ret[y_off + x] = f(pix);
             }
         }
         Ok(ret)
     }
 
+    /// Consumes decoder and returns a vector of Rgb<u8> pixels.
+    /// scale = 1, gamma = 2.2
+    pub fn read_image_ldr(mut self) -> ImageResult<Vec<Rgb<u8>>> {
+        self.read_image_transform(|pix|pix.to_ldr())
+    }
+
+    /// Consumes decoder and returns a vector of Rgb<f32> pixels.
+    /// 
+    pub fn read_image_hdr(mut self) -> ImageResult<Vec<Rgb<f32>>> {
+        self.read_image_transform(|pix|pix.to_hdr())
+    }
+
 }
 
-impl<R: Read + Seek> IntoIterator for HDRDecoder<R> {
+impl<R: Read> IntoIterator for HDRDecoder<R> {
     type Item = ImageResult<RGBE8Pixel>;
     type IntoIter = HDRImageDecoderIterator<R>;
 
@@ -659,7 +742,7 @@ fn split_at_first_test() {
 // Reads inpult until b"\n" or EOF
 // Returns vector of read bytes NOT including end of line characters
 //   or return None to indicate end of file
-fn read_line_u8<R: Read + Seek>(r: &mut R) -> ::std::io::Result<Option<Vec<u8>>> {
+fn read_line_u8<R: Read>(r: &mut R) -> ::std::io::Result<Option<Vec<u8>>> {
     let mut ret = Vec::with_capacity(16);
     let mut no_data = true;
 
