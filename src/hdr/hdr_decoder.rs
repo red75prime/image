@@ -227,7 +227,7 @@ impl<R: Read + Seek> IntoIterator for HDRDecoder<R> {
             buf: buf,
             col: 0,
             scanline: 0,
-            trouble: self.width == 0, // make `next()` check conditions
+            trouble: true, // make first call to `next()` read scanline 
             error_encountered: false,
         }
     }
