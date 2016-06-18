@@ -30,6 +30,15 @@ impl<R: Read> HDRAdapter<R> {
             meta: meta,
         })
     }
+
+    pub fn new_nonstrict(r: R) -> ImageResult<HDRAdapter<R>> {
+        let decoder = try!(HDRDecoder::with_strictness(r, false));
+        let meta = decoder.metadata();
+        Ok(HDRAdapter{ 
+            inner: Some(decoder), 
+            meta: meta,
+        })
+    }
 }
 
 impl<R: Read> ImageDecoder for HDRAdapter<R> {

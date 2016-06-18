@@ -550,6 +550,7 @@ fn open_impl(path: &Path) -> ImageResult<DynamicImage> {
         "bmp" => image::ImageFormat::BMP,
         "ico" => image::ImageFormat::ICO,
         "hdr" => image::ImageFormat::HDR,
+        "pic" => image::ImageFormat::PIC,
         format => return Err(image::ImageError::UnsupportedError(format!(
             "Image format image/{:?} is not supported.",
             format
@@ -616,6 +617,8 @@ pub fn load<R: Read+Seek>(r: R, format: ImageFormat) -> ImageResult<DynamicImage
         image::ImageFormat::ICO => decoder_to_image(try!(ico::ICODecoder::new(r))),
         #[cfg(feature = "hdr")]
         image::ImageFormat::HDR => decoder_to_image(try!(hdr::HDRAdapter::new(r))),
+        #[cfg(feature = "hdr")]
+        image::ImageFormat::PIC => decoder_to_image(try!(hdr::HDRAdapter::new_nonstrict(r))),
         _ => Err(image::ImageError::UnsupportedError(format!("A decoder for {:?} is not available.", format))),
     }
 }
