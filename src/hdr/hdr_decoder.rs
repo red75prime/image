@@ -96,18 +96,14 @@ pub struct HDRDecoder<R> {
 /// Refer to [wikipedia](https://en.wikipedia.org/wiki/RGBE_image_format)
 #[repr(C)] #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RGBE8Pixel {
-    /// Red mantissa
-    pub r: u8,
-    /// Green mantissa
-    pub g: u8,
-    /// Blue mantissa
-    pub b: u8,
-    /// Colorless exponent
+    /// Color components
+    pub c: [u8; 3],
+    /// Exponent
     pub e: u8,
 }
 
 pub fn rgbe8(r: u8, g: u8, b: u8, e: u8) -> RGBE8Pixel {
-    RGBE8Pixel { r: r, g: g, b: b, e: e }
+    RGBE8Pixel { c: [r, g, b], e: e }
 }
 
 impl RGBE8Pixel {
@@ -118,7 +114,7 @@ impl RGBE8Pixel {
         } else {
 //            let exp = f32::ldexp(1., self.e as isize - (128 + 8)); // unstable
             let exp = f32::exp2(self.e as f32 - (128. + 8.));
-            Rgb([exp*(self.r as f32), exp*(self.g as f32), exp*(self.b as f32)])
+            Rgb([exp*(self.c[0] as f32), exp*(self.c[1] as f32), exp*(self.c[2] as f32)])
         }
     }
 
@@ -407,13 +403,13 @@ fn read_scanline<R: Read>(r: &mut R, buf: &mut [RGBE8Pixel]) -> ImageResult<()> 
     let width = buf.len();
     // first 4 bytes in scanline allow to determine compression method
     let fb = try!(read_rgbe(r)); 
-    if fb.r == 2 && fb.g == 2 && fb.b < 128 {
+    if fb.c[0] == 2 && fb.c[1] == 2 && fb.c[2] < 128 {
         // denormalized pixel value (2,2,<128,_) indicates new per component RLE method
         // decode_component guaranties that offset is within 0 .. width
         // therefore we can skip bounds checking here, but we will not
-        try!(decode_component(r, width, |offset, value| buf[offset].r = value ));
-        try!(decode_component(r, width, |offset, value| buf[offset].g = value ));
-        try!(decode_component(r, width, |offset, value| buf[offset].b = value ));
+        try!(decode_component(r, width, |offset, value| buf[offset].c[0] = value ));
+        try!(decode_component(r, width, |offset, value| buf[offset].c[1] = value ));
+        try!(decode_component(r, width, |offset, value| buf[offset].c[2] = value ));
         try!(decode_component(r, width, |offset, value| buf[offset].e = value ));
     } else { 
         // old RLE method (it was considered old around 1991, should it be here?)
@@ -481,7 +477,7 @@ fn decode_old_rle<R: Read>(r: &mut R, fb: RGBE8Pixel, buf: &mut [RGBE8Pixel]) ->
     // returns run length if pixel is a run length marker
     #[inline]  
     fn rl_marker(pix : RGBE8Pixel) -> Option<usize> {
-        if pix.r == 1 && pix.g == 1 && pix.b == 1 {
+        if pix.c == [1, 1, 1] {
             Some(pix.e as usize)
         } else {
             None
