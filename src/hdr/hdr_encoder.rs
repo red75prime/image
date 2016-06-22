@@ -1,6 +1,6 @@
 use std::io::{Write, Result};
 use color::{Rgb, FromColor};
-use hdr::{SIGNATURE, RGBE8Pixel};
+use hdr::{SIGNATURE, RGBE8Pixel, rgbe8};
 
 pub struct HDREncoder<W: Write> {
     w: W,
@@ -13,21 +13,287 @@ impl<W: Write> HDREncoder<W> {
         }
     }
 
-    pub fn encode<T>(mut self, data: &[T], width: usize, height: usize) -> Result<()> 
-    where Rgb<f32>: FromColor<T> {
+    pub fn encode(mut self, data: &[Rgb<f32>], width: usize, height: usize) -> Result<()> {
         assert!(data.len() >= width*height);
         let w = &mut self.w;
         try!(w.write_all(SIGNATURE));
         try!(w.write_all(b"\n"));
         try!(w.write_all(b"# Rust Radiance HDR encoder\n\n"));
-        try!(w.write_all(format!("-Y {} +X {}", height, width).as_bytes()));
+        try!(w.write_all(format!("-Y {} +X {}\n", height, width).as_bytes()));
+
+        // buffers for encoded pixels
+        let mut bufr = Vec::with_capacity(width);
+        bufr.resize(width, 0);
+        let mut bufg = Vec::with_capacity(width);
+        bufg.resize(width, 0);
+        let mut bufb = Vec::with_capacity(width);
+        bufb.resize(width, 0);
+        let mut bufe = Vec::with_capacity(width);
+        bufe.resize(width, 0);
+        //let mut rle_buf = Vec::with_capacity(width); 
         for scanline in data.chunks(width) {
-            for pix in scanline {
-                 
+            for ((((r,g),b),e), &pix) in bufr.iter_mut().zip(bufg.iter_mut())
+                                                .zip(bufb.iter_mut())
+                                                .zip(bufe.iter_mut())
+                                                .zip(scanline.iter()) {
+                let cp = to_rgbe8(pix);
+                *r = cp.c[0];
+                *g = cp.c[1];
+                *b = cp.c[2];
+                *e = cp.e;
             }
+            try!(write_rgbe8(w, rgbe8(2,2,2,2))); // New RLE encoding marker
+
         }
         Ok(())
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum RunOrNot {
+    Run(u8, usize),
+    Norun(usize, usize),
+}
+use self::RunOrNot::{Run, Norun};
+
+struct RunIterator<'a> {
+    data: &'a [u8],
+    curidx: usize,
+}
+
+impl<'a> RunIterator<'a> {
+    fn new(data: &'a [u8]) -> RunIterator<'a> {
+        RunIterator{
+            data: data,
+            curidx: 0,
+        }
+    }
+}
+
+impl<'a> Iterator for RunIterator<'a> {
+    type Item = RunOrNot;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.curidx == self.data.len() {
+            None
+        } else {
+            let cv = self.data[self.curidx];
+            let crun = self.data[self.curidx ..].iter().take_while(|&&v| v == cv).count();
+            let ret = if crun > 2 { Run(cv, crun) } else { Norun(self.curidx, crun) };
+            self.curidx += crun;
+            Some(ret)
+        }
+    } 
+}
+
+#[test]
+fn runiterator_test() {
+    let data = [];
+    let mut run_iter = RunIterator::new(&data[..]);
+    assert_eq!(run_iter.next(), None);
+    let data = [5];
+    let mut run_iter = RunIterator::new(&data[..]);
+    assert_eq!(run_iter.next(), Some(Norun(0, 1)));
+    assert_eq!(run_iter.next(), None);
+    let data = [1,1];
+    let mut run_iter = RunIterator::new(&data[..]);
+    assert_eq!(run_iter.next(), Some(Norun(0, 2)));
+    assert_eq!(run_iter.next(), None);
+    let data = [0,0,0];
+    let mut run_iter = RunIterator::new(&data[..]);
+    assert_eq!(run_iter.next(), Some(Run(0u8, 3)));
+    assert_eq!(run_iter.next(), None);
+    let data = [0,0,1,1];
+    let mut run_iter = RunIterator::new(&data[..]);
+    assert_eq!(run_iter.next(), Some(Norun(0, 2)));
+    assert_eq!(run_iter.next(), Some(Norun(2, 2)));
+    assert_eq!(run_iter.next(), None);
+    let data = [0,0,0,1,1];
+    let mut run_iter = RunIterator::new(&data[..]);
+    assert_eq!(run_iter.next(), Some(Run(0u8, 3)));
+    assert_eq!(run_iter.next(), Some(Norun(3, 2)));
+    assert_eq!(run_iter.next(), None);
+    let data = [1,2,2,2];
+    let mut run_iter = RunIterator::new(&data[..]);
+    assert_eq!(run_iter.next(), Some(Norun(0, 1)));
+    assert_eq!(run_iter.next(), Some(Run(2u8, 3)));
+    assert_eq!(run_iter.next(), None);
+    let data = [1,1,2,2,2];
+    let mut run_iter = RunIterator::new(&data[..]);
+    assert_eq!(run_iter.next(), Some(Norun(0, 2)));
+    assert_eq!(run_iter.next(), Some(Run(2u8, 3)));
+    assert_eq!(run_iter.next(), None);
+}
+
+struct NorunCombineIterator<'a> {
+    runiter: RunIterator<'a>,
+    prev: Option<RunOrNot>,
+}
+
+impl<'a> NorunCombineIterator<'a> {
+    fn new(data: &'a [u8]) -> NorunCombineIterator<'a> {
+        NorunCombineIterator {
+            runiter: RunIterator::new(data),
+            prev: None,
+        }
+    }
+}
+
+impl<'a> Iterator for NorunCombineIterator<'a> {
+    type Item = RunOrNot;
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            match self.prev.take() {
+                Some(Run(c, len)) => { // Just return stored run
+                    return Some(Run(c, len));
+                }, 
+                Some(Norun(idx, len)) => { // Let's see if we need to continue norun
+                    match self.runiter.next() {
+                        Some(Norun(_, len1)) => { // norun continues
+                            self.prev = Some(Norun(idx, len + len1));
+                            // combine and continue loop
+                        },
+                        Some(Run(c, len1)) => { // Run encountered. Store it
+                            self.prev = Some(Run(c, len1));
+                            return Some(Norun(idx, len)); // and return combined norun
+                        },
+                        None => { // End of sequence
+                            return Some(Norun(idx, len)); // return combined norun
+                        },
+                    }
+                }, // End match self.prev.take() == Some(NoRun())
+                None => { // No norun to combine
+                    match self.runiter.next() {
+                        Some(Norun(idx, len)) => {
+                            self.prev = Some(Norun(idx, len));
+                            // store for combine and continue the loop
+                        },
+                        Some(Run(c, len)) => { // Some run. Just return it
+                            return Some(Run(c, len));
+                        },
+                        None => { // That's all, folks
+                            return None;
+                        },
+                    }
+                }, // End match self.prev.take() == None
+            } // End match 
+        } // End loop
+    }
+}
+
+struct RunSplitIterator<'a> {
+    iter: NorunCombineIterator<'a>,
+    cur: Option<RunOrNot>,
+}
+
+impl<'a> RunSplitIterator<'a> {
+    fn new(data: &'a [u8]) -> RunSplitIterator<'a> {
+        RunSplitIterator {
+            iter: NorunCombineIterator::new(data),
+            cur: None,
+        }
+    }
+}
+
+const RUN_MAX_LEN: usize = 127;
+const NORUN_MAX_LEN: usize = 128;
+
+impl<'a> Iterator for RunSplitIterator<'a> {
+    type Item = RunOrNot;
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.cur.take().or_else(||self.iter.next()) {
+            None => {
+                None
+            },
+            Some(Run(c, len)) => {
+                let max_len = RUN_MAX_LEN; 
+                if len <= max_len {
+                    return Some(Run(c, len));
+                } else {
+                    self.cur = Some(Run(c, len - max_len));
+                    return Some(Run(c, max_len));
+                }
+            },
+            Some(Norun(idx, len)) => {
+                let max_len = NORUN_MAX_LEN; 
+                if len <= max_len {
+                    return Some(Norun(idx, len));
+                } else {
+                    self.cur = Some(Norun(idx + max_len, len - max_len));
+                    return Some(Norun(idx, max_len));
+                }
+            },
+        }
+    }
+}
+
+#[test]
+fn runsplit_test() {
+    fn a<T>(mut v: Vec<T>, mut other: Vec<T>) -> Vec<T> {
+        v.append(&mut other);
+        v
+    }
+
+    let v = vec![];
+    let mut rsi = RunSplitIterator::new(&v[..]);
+    assert_eq!(rsi.next(), None);
+
+    let v = vec![1];
+    let mut rsi = RunSplitIterator::new(&v[..]);
+    assert_eq!(rsi.next(), Some(Norun(0,1)));
+    assert_eq!(rsi.next(), None);
+
+    let v = vec![2,2];
+    let mut rsi = RunSplitIterator::new(&v[..]);
+    assert_eq!(rsi.next(), Some(Norun(0,2)));
+    assert_eq!(rsi.next(), None);
+
+    let v = vec![3,3,3];
+    let mut rsi = RunSplitIterator::new(&v[..]);
+    assert_eq!(rsi.next(), Some(Run(3,3)));
+    assert_eq!(rsi.next(), None);
+
+    let v = vec![4,4,3,3,3];
+    let mut rsi = RunSplitIterator::new(&v[..]);
+    assert_eq!(rsi.next(), Some(Norun(0,2)));
+    assert_eq!(rsi.next(), Some(Run(3,3)));
+    assert_eq!(rsi.next(), None);
+
+    let v = a(a(vec![5; 3], vec![6; 129]), vec![7, 3, 7, 10, 255]);
+    let mut rsi = RunSplitIterator::new(&v[..]);
+    assert_eq!(rsi.next(), Some(Run(5, 3)));
+    assert_eq!(rsi.next(), Some(Run(6, 127)));
+    assert_eq!(rsi.next(), Some(Run(6, 2)));
+    assert_eq!(rsi.next(), Some(Norun(132, 5)));
+    assert_eq!(rsi.next(), None);
+
+    let v = a(a(vec![5; 2], vec![6; 129]), vec![7, 3, 7, 7, 255]);
+    let mut rsi = RunSplitIterator::new(&v[..]);
+    assert_eq!(rsi.next(), Some(Norun(0, 2)));
+    assert_eq!(rsi.next(), Some(Run(6, 127)));
+    assert_eq!(rsi.next(), Some(Run(6, 2)));
+    assert_eq!(rsi.next(), Some(Norun(131, 5)));
+    assert_eq!(rsi.next(), None);
+     
+}
+
+fn rle_compress(data: &[u8], rle: &mut Vec<u8>) {
+    rle.clear();
+    if data.len() == 0 {
+        rle.push(0); // Technically correct. It means read next 0 bytes.
+        return;
+    }
+    // Task: split data into chunks of repeating (max 127) and non-repeating bytes (max 128)
+    // Prepend non-repeating chunk with its length
+    // Replace repeating byte with (run length + 128) and the byte
+}
+
+fn write_rgbe8<W: Write>(w: &mut W, v: RGBE8Pixel) -> Result<()> {
+    let buf: [u8; 4] = unsafe {
+      // It's safe, RGBE8Pixel doesn't implement Drop and it is repr(C)  
+      ::std::mem::transmute(v) 
+    };
+    w.write_all(&buf[..])
 }
 
 pub fn to_rgbe8(pix: Rgb<f32>) -> RGBE8Pixel {
@@ -79,7 +345,7 @@ fn to_rgbe8_test() {
         let max_val = a.data.iter().chain(b.data.iter()).fold(0., |maxv, &a| f32::max(maxv, a));
         if max_val == 0. { 0. } else { max_diff / max_val }
     }
-   let test_values = vec![0.000_001, 0.000_02, 0.000_3, 0.004, 0.05, 0.6, 7., 80., 900., 1_000., 20_000., 300_000.];
+    let test_values = vec![0.000_001, 0.000_02, 0.000_3, 0.004, 0.05, 0.6, 7., 80., 900., 1_000., 20_000., 300_000.];
     for &r in &test_values {
         for &g in &test_values {
             for &b in &test_values {
