@@ -56,6 +56,9 @@ enum RunOrNot {
 }
 use self::RunOrNot::{Run, Norun};
 
+const RUN_MAX_LEN: usize = 127;
+const NORUN_MAX_LEN: usize = 128;
+
 struct RunIterator<'a> {
     data: &'a [u8],
     curidx: usize,
@@ -78,7 +81,7 @@ impl<'a> Iterator for RunIterator<'a> {
             None
         } else {
             let cv = self.data[self.curidx];
-            let crun = self.data[self.curidx ..].iter().take_while(|&&v| v == cv).count();
+            let crun = self.data[self.curidx ..].iter().take_while(|&&v| v == cv).take(RUN_MAX_LEN).count();
             let ret = if crun > 2 { Run(cv, crun) } else { Norun(self.curidx, crun) };
             self.curidx += crun;
             Some(ret)
@@ -123,6 +126,21 @@ fn runiterator_test() {
     assert_eq!(run_iter.next(), Some(Norun(0, 2)));
     assert_eq!(run_iter.next(), Some(Run(2u8, 3)));
     assert_eq!(run_iter.next(), None);
+    let data = [2;128];
+    let mut run_iter = RunIterator::new(&data[..]);
+    assert_eq!(run_iter.next(), Some(Run(2u8, 127)));
+    assert_eq!(run_iter.next(), Some(Norun(127, 1)));
+    assert_eq!(run_iter.next(), None);
+    let data = [2;129];
+    let mut run_iter = RunIterator::new(&data[..]);
+    assert_eq!(run_iter.next(), Some(Run(2u8, 127)));
+    assert_eq!(run_iter.next(), Some(Norun(127, 2)));
+    assert_eq!(run_iter.next(), None);
+    let data = [2;130];
+    let mut run_iter = RunIterator::new(&data[..]);
+    assert_eq!(run_iter.next(), Some(Run(2u8, 127)));
+    assert_eq!(run_iter.next(), Some(Run(2u8, 3)));
+    assert_eq!(run_iter.next(), None);
 }
 
 struct NorunCombineIterator<'a> {
@@ -150,8 +168,18 @@ impl<'a> Iterator for NorunCombineIterator<'a> {
                 Some(Norun(idx, len)) => { // Let's see if we need to continue norun
                     match self.runiter.next() {
                         Some(Norun(_, len1)) => { // norun continues
-                            self.prev = Some(Norun(idx, len + len1));
-                            // combine and continue loop
+                            let clen = len + len1; // combined length
+                            if clen == NORUN_MAX_LEN {
+                                return Some(Norun(idx, clen))
+                            } else if clen > NORUN_MAX_LEN {
+                                // combined norun exceeds maximum length. store extra part of norun
+                                self.prev = Some(Norun(idx + NORUN_MAX_LEN, clen - NORUN_MAX_LEN));
+                                // then return maximal norun 
+                                return Some(Norun(idx, NORUN_MAX_LEN)); 
+                            } else { // len + len1 < NORUN_MAX_LEN
+                                self.prev = Some(Norun(idx, len + len1));
+                                // combine and continue loop
+                            }
                         },
                         Some(Run(c, len1)) => { // Run encountered. Store it
                             self.prev = Some(Run(c, len1));
@@ -181,100 +209,67 @@ impl<'a> Iterator for NorunCombineIterator<'a> {
     }
 }
 
-struct RunSplitIterator<'a> {
-    iter: NorunCombineIterator<'a>,
-    cur: Option<RunOrNot>,
-}
-
-impl<'a> RunSplitIterator<'a> {
-    fn new(data: &'a [u8]) -> RunSplitIterator<'a> {
-        RunSplitIterator {
-            iter: NorunCombineIterator::new(data),
-            cur: None,
-        }
-    }
-}
-
-const RUN_MAX_LEN: usize = 127;
-const NORUN_MAX_LEN: usize = 128;
-
-impl<'a> Iterator for RunSplitIterator<'a> {
-    type Item = RunOrNot;
-    fn next(&mut self) -> Option<Self::Item> {
-        match self.cur.take().or_else(||self.iter.next()) {
-            None => {
-                None
-            },
-            Some(Run(c, len)) => {
-                let max_len = RUN_MAX_LEN; 
-                if len <= max_len {
-                    return Some(Run(c, len));
-                } else {
-                    self.cur = Some(Run(c, len - max_len));
-                    return Some(Run(c, max_len));
-                }
-            },
-            Some(Norun(idx, len)) => {
-                let max_len = NORUN_MAX_LEN; 
-                if len <= max_len {
-                    return Some(Norun(idx, len));
-                } else {
-                    self.cur = Some(Norun(idx + max_len, len - max_len));
-                    return Some(Norun(idx, max_len));
-                }
-            },
-        }
-    }
-}
 
 #[test]
-fn runsplit_test() {
+fn noruncombine_test() {
     fn a<T>(mut v: Vec<T>, mut other: Vec<T>) -> Vec<T> {
         v.append(&mut other);
         v
     }
 
     let v = vec![];
-    let mut rsi = RunSplitIterator::new(&v[..]);
+    let mut rsi = NorunCombineIterator::new(&v[..]);
     assert_eq!(rsi.next(), None);
 
     let v = vec![1];
-    let mut rsi = RunSplitIterator::new(&v[..]);
+    let mut rsi = NorunCombineIterator::new(&v[..]);
     assert_eq!(rsi.next(), Some(Norun(0,1)));
     assert_eq!(rsi.next(), None);
 
     let v = vec![2,2];
-    let mut rsi = RunSplitIterator::new(&v[..]);
+    let mut rsi = NorunCombineIterator::new(&v[..]);
     assert_eq!(rsi.next(), Some(Norun(0,2)));
     assert_eq!(rsi.next(), None);
 
     let v = vec![3,3,3];
-    let mut rsi = RunSplitIterator::new(&v[..]);
+    let mut rsi = NorunCombineIterator::new(&v[..]);
     assert_eq!(rsi.next(), Some(Run(3,3)));
     assert_eq!(rsi.next(), None);
 
     let v = vec![4,4,3,3,3];
-    let mut rsi = RunSplitIterator::new(&v[..]);
+    let mut rsi = NorunCombineIterator::new(&v[..]);
     assert_eq!(rsi.next(), Some(Norun(0,2)));
     assert_eq!(rsi.next(), Some(Run(3,3)));
     assert_eq!(rsi.next(), None);
 
+    let v = vec![40; 400];
+    let mut rsi = NorunCombineIterator::new(&v[..]);
+    assert_eq!(rsi.next(), Some(Run(40,127)));
+    assert_eq!(rsi.next(), Some(Run(40,127)));
+    assert_eq!(rsi.next(), Some(Run(40,127)));
+    assert_eq!(rsi.next(), Some(Run(40,19)));
+    assert_eq!(rsi.next(), None);
+
     let v = a(a(vec![5; 3], vec![6; 129]), vec![7, 3, 7, 10, 255]);
-    let mut rsi = RunSplitIterator::new(&v[..]);
+    let mut rsi = NorunCombineIterator::new(&v[..]);
     assert_eq!(rsi.next(), Some(Run(5, 3)));
     assert_eq!(rsi.next(), Some(Run(6, 127)));
-    assert_eq!(rsi.next(), Some(Run(6, 2)));
-    assert_eq!(rsi.next(), Some(Norun(132, 5)));
+    assert_eq!(rsi.next(), Some(Norun(130, 7)));
     assert_eq!(rsi.next(), None);
 
     let v = a(a(vec![5; 2], vec![6; 129]), vec![7, 3, 7, 7, 255]);
-    let mut rsi = RunSplitIterator::new(&v[..]);
+    let mut rsi = NorunCombineIterator::new(&v[..]);
     assert_eq!(rsi.next(), Some(Norun(0, 2)));
     assert_eq!(rsi.next(), Some(Run(6, 127)));
-    assert_eq!(rsi.next(), Some(Run(6, 2)));
-    assert_eq!(rsi.next(), Some(Norun(131, 5)));
+    assert_eq!(rsi.next(), Some(Norun(129, 7)));
     assert_eq!(rsi.next(), None);
-     
+    
+    let v: Vec<_> = ::std::iter::repeat(()).flat_map(|_|(0..2)).take(257).collect();
+    let mut rsi = NorunCombineIterator::new(&v[..]);
+    assert_eq!(rsi.next(), Some(Norun(0, 128)));
+    assert_eq!(rsi.next(), Some(Norun(128, 128)));
+    assert_eq!(rsi.next(), Some(Norun(256, 1)));
+    assert_eq!(rsi.next(), None);    
 }
 
 fn rle_compress(data: &[u8], rle: &mut Vec<u8>) {
