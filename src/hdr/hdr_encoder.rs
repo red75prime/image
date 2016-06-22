@@ -18,32 +18,51 @@ impl<W: Write> HDREncoder<W> {
         let w = &mut self.w;
         try!(w.write_all(SIGNATURE));
         try!(w.write_all(b"\n"));
-        try!(w.write_all(b"# Rust Radiance HDR encoder\n\n"));
+        try!(w.write_all(b"# Rust HDR encoder\n"));
+        try!(w.write_all(b"FORMAT=32-bit_rle_rgbe\n\n"));
         try!(w.write_all(format!("-Y {} +X {}\n", height, width).as_bytes()));
 
-        // buffers for encoded pixels
-        let mut bufr = Vec::with_capacity(width);
-        bufr.resize(width, 0);
-        let mut bufg = Vec::with_capacity(width);
-        bufg.resize(width, 0);
-        let mut bufb = Vec::with_capacity(width);
-        bufb.resize(width, 0);
-        let mut bufe = Vec::with_capacity(width);
-        bufe.resize(width, 0);
-        //let mut rle_buf = Vec::with_capacity(width); 
-        for scanline in data.chunks(width) {
-            for ((((r,g),b),e), &pix) in bufr.iter_mut().zip(bufg.iter_mut())
-                                                .zip(bufb.iter_mut())
-                                                .zip(bufe.iter_mut())
-                                                .zip(scanline.iter()) {
-                let cp = to_rgbe8(pix);
-                *r = cp.c[0];
-                *g = cp.c[1];
-                *b = cp.c[2];
-                *e = cp.e;
+        if width < 8 || width > 32768 {
+            for &pix in data {
+                try!(write_rgbe8(w, to_rgbe8(pix)));
             }
-            try!(write_rgbe8(w, rgbe8(2,2,2,2))); // New RLE encoding marker
-
+        } else {
+            // new RLE marker contains scanline width
+            let marker = rgbe8(2, 2, (width/256) as u8, (width % 256) as u8);
+            // buffers for encoded pixels
+            let mut bufr = Vec::with_capacity(width);
+            bufr.resize(width, 0);
+            let mut bufg = Vec::with_capacity(width);
+            bufg.resize(width, 0);
+            let mut bufb = Vec::with_capacity(width);
+            bufb.resize(width, 0);
+            let mut bufe = Vec::with_capacity(width);
+            bufe.resize(width, 0);
+            let mut rle_buf = Vec::with_capacity(width); 
+            for scanline in data.chunks(width) {
+                for (i, &pix) in scanline.iter().enumerate() {
+                    let cp = to_rgbe8(pix);
+                    unsafe {
+                        *bufr.get_unchecked_mut(i) = cp.c[0];
+                        *bufg.get_unchecked_mut(i) = cp.c[1];
+                        *bufb.get_unchecked_mut(i) = cp.c[2];
+                        *bufe.get_unchecked_mut(i) = cp.e;
+                    }
+                }
+                try!(write_rgbe8(w, marker)); // New RLE encoding marker
+                rle_buf.clear();
+                rle_compress(&bufr[..], &mut rle_buf);
+                try!(w.write_all(&rle_buf[..]));
+                rle_buf.clear();
+                rle_compress(&bufg[..], &mut rle_buf);
+                try!(w.write_all(&rle_buf[..]));
+                rle_buf.clear();
+                rle_compress(&bufb[..], &mut rle_buf);
+                try!(w.write_all(&rle_buf[..]));
+                rle_buf.clear();
+                rle_compress(&bufe[..], &mut rle_buf);
+                try!(w.write_all(&rle_buf[..]));
+            }
         }
         Ok(())
     }
@@ -89,60 +108,6 @@ impl<'a> Iterator for RunIterator<'a> {
     } 
 }
 
-#[test]
-fn runiterator_test() {
-    let data = [];
-    let mut run_iter = RunIterator::new(&data[..]);
-    assert_eq!(run_iter.next(), None);
-    let data = [5];
-    let mut run_iter = RunIterator::new(&data[..]);
-    assert_eq!(run_iter.next(), Some(Norun(0, 1)));
-    assert_eq!(run_iter.next(), None);
-    let data = [1,1];
-    let mut run_iter = RunIterator::new(&data[..]);
-    assert_eq!(run_iter.next(), Some(Norun(0, 2)));
-    assert_eq!(run_iter.next(), None);
-    let data = [0,0,0];
-    let mut run_iter = RunIterator::new(&data[..]);
-    assert_eq!(run_iter.next(), Some(Run(0u8, 3)));
-    assert_eq!(run_iter.next(), None);
-    let data = [0,0,1,1];
-    let mut run_iter = RunIterator::new(&data[..]);
-    assert_eq!(run_iter.next(), Some(Norun(0, 2)));
-    assert_eq!(run_iter.next(), Some(Norun(2, 2)));
-    assert_eq!(run_iter.next(), None);
-    let data = [0,0,0,1,1];
-    let mut run_iter = RunIterator::new(&data[..]);
-    assert_eq!(run_iter.next(), Some(Run(0u8, 3)));
-    assert_eq!(run_iter.next(), Some(Norun(3, 2)));
-    assert_eq!(run_iter.next(), None);
-    let data = [1,2,2,2];
-    let mut run_iter = RunIterator::new(&data[..]);
-    assert_eq!(run_iter.next(), Some(Norun(0, 1)));
-    assert_eq!(run_iter.next(), Some(Run(2u8, 3)));
-    assert_eq!(run_iter.next(), None);
-    let data = [1,1,2,2,2];
-    let mut run_iter = RunIterator::new(&data[..]);
-    assert_eq!(run_iter.next(), Some(Norun(0, 2)));
-    assert_eq!(run_iter.next(), Some(Run(2u8, 3)));
-    assert_eq!(run_iter.next(), None);
-    let data = [2;128];
-    let mut run_iter = RunIterator::new(&data[..]);
-    assert_eq!(run_iter.next(), Some(Run(2u8, 127)));
-    assert_eq!(run_iter.next(), Some(Norun(127, 1)));
-    assert_eq!(run_iter.next(), None);
-    let data = [2;129];
-    let mut run_iter = RunIterator::new(&data[..]);
-    assert_eq!(run_iter.next(), Some(Run(2u8, 127)));
-    assert_eq!(run_iter.next(), Some(Norun(127, 2)));
-    assert_eq!(run_iter.next(), None);
-    let data = [2;130];
-    let mut run_iter = RunIterator::new(&data[..]);
-    assert_eq!(run_iter.next(), Some(Run(2u8, 127)));
-    assert_eq!(run_iter.next(), Some(Run(2u8, 3)));
-    assert_eq!(run_iter.next(), None);
-}
-
 struct NorunCombineIterator<'a> {
     runiter: RunIterator<'a>,
     prev: Option<RunOrNot>,
@@ -170,7 +135,7 @@ impl<'a> Iterator for NorunCombineIterator<'a> {
                         Some(Norun(_, len1)) => { // norun continues
                             let clen = len + len1; // combined length
                             if clen == NORUN_MAX_LEN {
-                                return Some(Norun(idx, clen))
+                                return Some(Norun(idx, clen));
                             } else if clen > NORUN_MAX_LEN {
                                 // combined norun exceeds maximum length. store extra part of norun
                                 self.prev = Some(Norun(idx + NORUN_MAX_LEN, clen - NORUN_MAX_LEN));
@@ -210,68 +175,6 @@ impl<'a> Iterator for NorunCombineIterator<'a> {
 }
 
 
-#[test]
-fn noruncombine_test() {
-    fn a<T>(mut v: Vec<T>, mut other: Vec<T>) -> Vec<T> {
-        v.append(&mut other);
-        v
-    }
-
-    let v = vec![];
-    let mut rsi = NorunCombineIterator::new(&v[..]);
-    assert_eq!(rsi.next(), None);
-
-    let v = vec![1];
-    let mut rsi = NorunCombineIterator::new(&v[..]);
-    assert_eq!(rsi.next(), Some(Norun(0,1)));
-    assert_eq!(rsi.next(), None);
-
-    let v = vec![2,2];
-    let mut rsi = NorunCombineIterator::new(&v[..]);
-    assert_eq!(rsi.next(), Some(Norun(0,2)));
-    assert_eq!(rsi.next(), None);
-
-    let v = vec![3,3,3];
-    let mut rsi = NorunCombineIterator::new(&v[..]);
-    assert_eq!(rsi.next(), Some(Run(3,3)));
-    assert_eq!(rsi.next(), None);
-
-    let v = vec![4,4,3,3,3];
-    let mut rsi = NorunCombineIterator::new(&v[..]);
-    assert_eq!(rsi.next(), Some(Norun(0,2)));
-    assert_eq!(rsi.next(), Some(Run(3,3)));
-    assert_eq!(rsi.next(), None);
-
-    let v = vec![40; 400];
-    let mut rsi = NorunCombineIterator::new(&v[..]);
-    assert_eq!(rsi.next(), Some(Run(40,127)));
-    assert_eq!(rsi.next(), Some(Run(40,127)));
-    assert_eq!(rsi.next(), Some(Run(40,127)));
-    assert_eq!(rsi.next(), Some(Run(40,19)));
-    assert_eq!(rsi.next(), None);
-
-    let v = a(a(vec![5; 3], vec![6; 129]), vec![7, 3, 7, 10, 255]);
-    let mut rsi = NorunCombineIterator::new(&v[..]);
-    assert_eq!(rsi.next(), Some(Run(5, 3)));
-    assert_eq!(rsi.next(), Some(Run(6, 127)));
-    assert_eq!(rsi.next(), Some(Norun(130, 7)));
-    assert_eq!(rsi.next(), None);
-
-    let v = a(a(vec![5; 2], vec![6; 129]), vec![7, 3, 7, 7, 255]);
-    let mut rsi = NorunCombineIterator::new(&v[..]);
-    assert_eq!(rsi.next(), Some(Norun(0, 2)));
-    assert_eq!(rsi.next(), Some(Run(6, 127)));
-    assert_eq!(rsi.next(), Some(Norun(129, 7)));
-    assert_eq!(rsi.next(), None);
-    
-    let v: Vec<_> = ::std::iter::repeat(()).flat_map(|_|(0..2)).take(257).collect();
-    let mut rsi = NorunCombineIterator::new(&v[..]);
-    assert_eq!(rsi.next(), Some(Norun(0, 128)));
-    assert_eq!(rsi.next(), Some(Norun(128, 128)));
-    assert_eq!(rsi.next(), Some(Norun(256, 1)));
-    assert_eq!(rsi.next(), None);    
-}
-
 fn rle_compress(data: &[u8], rle: &mut Vec<u8>) {
     rle.clear();
     if data.len() == 0 {
@@ -281,6 +184,20 @@ fn rle_compress(data: &[u8], rle: &mut Vec<u8>) {
     // Task: split data into chunks of repeating (max 127) and non-repeating bytes (max 128)
     // Prepend non-repeating chunk with its length
     // Replace repeating byte with (run length + 128) and the byte
+    for rnr in NorunCombineIterator::new(data) {
+        match rnr {
+            Run(c, len) => {
+                assert!(len<=127);
+                rle.push(128u8 + len as u8);
+                rle.push(c);
+            },
+            Norun(idx, len) => {
+                assert!(len<=128);
+                rle.push(len as u8);
+                rle.extend_from_slice(&data[idx .. idx+len]);
+            }
+        }
+    }
 }
 
 fn write_rgbe8<W: Write>(w: &mut W, v: RGBE8Pixel) -> Result<()> {
@@ -353,3 +270,120 @@ fn to_rgbe8_test() {
         }
     }
 }
+
+#[test]
+fn runiterator_test() {
+    let data = [];
+    let mut run_iter = RunIterator::new(&data[..]);
+    assert_eq!(run_iter.next(), None);
+    let data = [5];
+    let mut run_iter = RunIterator::new(&data[..]);
+    assert_eq!(run_iter.next(), Some(Norun(0, 1)));
+    assert_eq!(run_iter.next(), None);
+    let data = [1,1];
+    let mut run_iter = RunIterator::new(&data[..]);
+    assert_eq!(run_iter.next(), Some(Norun(0, 2)));
+    assert_eq!(run_iter.next(), None);
+    let data = [0,0,0];
+    let mut run_iter = RunIterator::new(&data[..]);
+    assert_eq!(run_iter.next(), Some(Run(0u8, 3)));
+    assert_eq!(run_iter.next(), None);
+    let data = [0,0,1,1];
+    let mut run_iter = RunIterator::new(&data[..]);
+    assert_eq!(run_iter.next(), Some(Norun(0, 2)));
+    assert_eq!(run_iter.next(), Some(Norun(2, 2)));
+    assert_eq!(run_iter.next(), None);
+    let data = [0,0,0,1,1];
+    let mut run_iter = RunIterator::new(&data[..]);
+    assert_eq!(run_iter.next(), Some(Run(0u8, 3)));
+    assert_eq!(run_iter.next(), Some(Norun(3, 2)));
+    assert_eq!(run_iter.next(), None);
+    let data = [1,2,2,2];
+    let mut run_iter = RunIterator::new(&data[..]);
+    assert_eq!(run_iter.next(), Some(Norun(0, 1)));
+    assert_eq!(run_iter.next(), Some(Run(2u8, 3)));
+    assert_eq!(run_iter.next(), None);
+    let data = [1,1,2,2,2];
+    let mut run_iter = RunIterator::new(&data[..]);
+    assert_eq!(run_iter.next(), Some(Norun(0, 2)));
+    assert_eq!(run_iter.next(), Some(Run(2u8, 3)));
+    assert_eq!(run_iter.next(), None);
+    let data = [2;128];
+    let mut run_iter = RunIterator::new(&data[..]);
+    assert_eq!(run_iter.next(), Some(Run(2u8, 127)));
+    assert_eq!(run_iter.next(), Some(Norun(127, 1)));
+    assert_eq!(run_iter.next(), None);
+    let data = [2;129];
+    let mut run_iter = RunIterator::new(&data[..]);
+    assert_eq!(run_iter.next(), Some(Run(2u8, 127)));
+    assert_eq!(run_iter.next(), Some(Norun(127, 2)));
+    assert_eq!(run_iter.next(), None);
+    let data = [2;130];
+    let mut run_iter = RunIterator::new(&data[..]);
+    assert_eq!(run_iter.next(), Some(Run(2u8, 127)));
+    assert_eq!(run_iter.next(), Some(Run(2u8, 3)));
+    assert_eq!(run_iter.next(), None);
+}
+
+#[test]
+fn noruncombine_test() {
+    fn a<T>(mut v: Vec<T>, mut other: Vec<T>) -> Vec<T> {
+        v.append(&mut other);
+        v
+    }
+
+    let v = vec![];
+    let mut rsi = NorunCombineIterator::new(&v[..]);
+    assert_eq!(rsi.next(), None);
+
+    let v = vec![1];
+    let mut rsi = NorunCombineIterator::new(&v[..]);
+    assert_eq!(rsi.next(), Some(Norun(0,1)));
+    assert_eq!(rsi.next(), None);
+
+    let v = vec![2,2];
+    let mut rsi = NorunCombineIterator::new(&v[..]);
+    assert_eq!(rsi.next(), Some(Norun(0,2)));
+    assert_eq!(rsi.next(), None);
+
+    let v = vec![3,3,3];
+    let mut rsi = NorunCombineIterator::new(&v[..]);
+    assert_eq!(rsi.next(), Some(Run(3,3)));
+    assert_eq!(rsi.next(), None);
+
+    let v = vec![4,4,3,3,3];
+    let mut rsi = NorunCombineIterator::new(&v[..]);
+    assert_eq!(rsi.next(), Some(Norun(0,2)));
+    assert_eq!(rsi.next(), Some(Run(3,3)));
+    assert_eq!(rsi.next(), None);
+
+    let v = vec![40; 400];
+    let mut rsi = NorunCombineIterator::new(&v[..]);
+    assert_eq!(rsi.next(), Some(Run(40,127)));
+    assert_eq!(rsi.next(), Some(Run(40,127)));
+    assert_eq!(rsi.next(), Some(Run(40,127)));
+    assert_eq!(rsi.next(), Some(Run(40,19)));
+    assert_eq!(rsi.next(), None);
+
+    let v = a(a(vec![5; 3], vec![6; 129]), vec![7, 3, 7, 10, 255]);
+    let mut rsi = NorunCombineIterator::new(&v[..]);
+    assert_eq!(rsi.next(), Some(Run(5, 3)));
+    assert_eq!(rsi.next(), Some(Run(6, 127)));
+    assert_eq!(rsi.next(), Some(Norun(130, 7)));
+    assert_eq!(rsi.next(), None);
+
+    let v = a(a(vec![5; 2], vec![6; 129]), vec![7, 3, 7, 7, 255]);
+    let mut rsi = NorunCombineIterator::new(&v[..]);
+    assert_eq!(rsi.next(), Some(Norun(0, 2)));
+    assert_eq!(rsi.next(), Some(Run(6, 127)));
+    assert_eq!(rsi.next(), Some(Norun(129, 7)));
+    assert_eq!(rsi.next(), None);
+    
+    let v: Vec<_> = ::std::iter::repeat(()).flat_map(|_|(0..2)).take(257).collect();
+    let mut rsi = NorunCombineIterator::new(&v[..]);
+    assert_eq!(rsi.next(), Some(Norun(0, 128)));
+    assert_eq!(rsi.next(), Some(Norun(128, 128)));
+    assert_eq!(rsi.next(), Some(Norun(256, 1)));
+    assert_eq!(rsi.next(), None);    
+}
+
