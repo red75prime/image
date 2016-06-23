@@ -1,12 +1,12 @@
-extern crate rayon;
+extern crate scoped_threadpool;
 
 use num_traits::cast::NumCast;
 use num_traits::identities::Zero;
 use Primitive;
-use self::rayon::prelude::*;
+use self::scoped_threadpool::Pool;
 use std::borrow::Cow;
 use std::error::Error;
-use std::io::{Read, self};
+use std::io::{BufRead, self};
 use std::iter::{Iterator};
 
 use color::{ColorType, Rgb};
@@ -19,12 +19,12 @@ use image::{
 
 /// Adapter to conform to ```ImageDecoder``` trait
 #[derive(Debug)]
-pub struct HDRAdapter<R: Read> {
+pub struct HDRAdapter<R: BufRead> {
     inner: Option<HDRDecoder<R>>,
     meta: HDRMetadata,
 }
 
-impl<R: Read> HDRAdapter<R> {
+impl<R: BufRead> HDRAdapter<R> {
     pub fn new(r: R) -> ImageResult<HDRAdapter<R>> {
         let decoder = try!(HDRDecoder::new(r));
         let meta = decoder.metadata();
@@ -44,7 +44,7 @@ impl<R: Read> HDRAdapter<R> {
     }
 }
 
-impl<R: Read> ImageDecoder for HDRAdapter<R> {
+impl<R: BufRead> ImageDecoder for HDRAdapter<R> {
     fn dimensions(&mut self) -> ImageResult<(u32, u32)> {
         Ok((self.meta.width, self.meta.height))
     }
@@ -149,7 +149,7 @@ impl RGBE8Pixel {
 
 }
 
-impl<R: Read> HDRDecoder<R> {
+impl<R: BufRead> HDRDecoder<R> {
 
     /// Reads Radiance HDR image header from stream ```r```
     /// if the header is valid, creates HDRDecoder 
@@ -254,7 +254,7 @@ impl<R: Read> HDRDecoder<R> {
     }
 
     /// Consumes decoder and returns a vector of tranformed pixels
-    pub fn read_image_transform<T: Send, F: Sync + Fn(RGBE8Pixel)-> T>(mut self, f: F) -> ImageResult<Vec<T>> {
+    pub fn read_image_transform<T: Send, F: Send + Sync + Fn(RGBE8Pixel)-> T>(mut self, f: F) -> ImageResult<Vec<T>> {
         // Don't read anything if image is empty 
         if self.width == 0 || self.height ==0 {
             return Ok(vec![]);
@@ -270,19 +270,28 @@ impl<R: Read> HDRDecoder<R> {
             ret.set_len(pixel_count);
         } // ret contains uninitialized data, so now it's my responsibility to return fully initialized ret
 
-        let mut buf = Vec::<RGBE8Pixel>::with_capacity(pixel_count);
-        unsafe {
-            buf.set_len(pixel_count)
-        }
-        for chunk in buf.chunks_mut(uszwidth) {
-            try!(read_scanline(&mut self.r, chunk));
+        {
+            let chunks_iter = ret.chunks_mut(uszwidth);
+            let mut pool = Pool::new(8); //  
+
+            try!(pool.scoped(|scope| {
+                for (idx, chunk) in chunks_iter.enumerate() {
+                    let mut buf = Vec::<RGBE8Pixel>::with_capacity(uszwidth);
+                    unsafe {
+                        buf.set_len(uszwidth);
+                    }
+                    try!(read_scanline(&mut self.r, &mut buf[..]));
+                    let f = &f;
+                    scope.execute(move || {
+                        for (dst, &pix) in chunk.iter_mut().zip(buf.iter()) {
+                            *dst = f(pix);
+                        }
+                    });
+                }
+                Ok(())
+            }) as Result<(), ImageError>);
         }
 
-        ret.par_chunks_mut(uszwidth).zip(buf.par_chunks(uszwidth)).for_each(|(chunk, buf)| {
-            for (dst, &pix) in chunk.iter_mut().zip(buf.iter()) {
-                *dst = f(pix);
-            }
-        });
         Ok(ret)
     }
 
@@ -300,7 +309,7 @@ impl<R: Read> HDRDecoder<R> {
 
 }
 
-impl<R: Read> IntoIterator for HDRDecoder<R> {
+impl<R: BufRead> IntoIterator for HDRDecoder<R> {
     type Item = ImageResult<RGBE8Pixel>;
     type IntoIter = HDRImageDecoderIterator<R>;
 
@@ -325,7 +334,7 @@ impl<R: Read> IntoIterator for HDRDecoder<R> {
 }
 
 /// Scanline buffered pixel by pixel iterator
-pub struct HDRImageDecoderIterator<R: Read> {
+pub struct HDRImageDecoderIterator<R: BufRead> {
     r: R,
     scanline_cnt: usize,
     buf: Vec<RGBE8Pixel>, // scanline buffer
@@ -335,7 +344,7 @@ pub struct HDRImageDecoderIterator<R: Read> {
     error_encountered: bool,
 }
 
-impl<R: Read> HDRImageDecoderIterator<R> {
+impl<R: BufRead> HDRImageDecoderIterator<R> {
 
     // Advances counter to the next pixel
     #[inline]
@@ -349,7 +358,7 @@ impl<R: Read> HDRImageDecoderIterator<R> {
     }
 }
 
-impl<R: Read> Iterator for HDRImageDecoderIterator<R> {
+impl<R: BufRead> Iterator for HDRImageDecoderIterator<R> {
     type Item = ImageResult<RGBE8Pixel>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -398,10 +407,10 @@ impl<R: Read> Iterator for HDRImageDecoderIterator<R> {
     }
 }
 
-impl<R: Read> ExactSizeIterator for HDRImageDecoderIterator<R> {} 
+impl<R: BufRead> ExactSizeIterator for HDRImageDecoderIterator<R> {} 
 
 // Precondition: buf.len() > 0
-fn read_scanline<R: Read>(r: &mut R, buf: &mut [RGBE8Pixel]) -> ImageResult<()> {
+fn read_scanline<R: BufRead>(r: &mut R, buf: &mut [RGBE8Pixel]) -> ImageResult<()> {
     assert!(buf.len()>0);
     let width = buf.len();
     // first 4 bytes in scanline allow to determine compression method
@@ -422,7 +431,7 @@ fn read_scanline<R: Read>(r: &mut R, buf: &mut [RGBE8Pixel]) -> ImageResult<()> 
 }
 
 #[inline(always)]
-fn read_byte<R: Read>(r: &mut R) -> io::Result<u8> {
+fn read_byte<R: BufRead>(r: &mut R) -> io::Result<u8> {
     let mut buf = [0u8];
     try!(r.read_exact(&mut buf[..]));
     Ok(buf[0])
@@ -430,7 +439,7 @@ fn read_byte<R: Read>(r: &mut R) -> io::Result<u8> {
 
 // Guaranties that first parameter of set_component will be within pos .. pos+width
 #[inline]
-fn decode_component<R: Read, S: FnMut(usize, u8)>(r: &mut R, width: usize, mut set_component: S) -> ImageResult<()> {
+fn decode_component<R: BufRead, S: FnMut(usize, u8)>(r: &mut R, width: usize, mut set_component: S) -> ImageResult<()> {
     let mut buf = [0; 128];
     let mut pos = 0;
     while pos < width {
@@ -473,7 +482,7 @@ fn decode_component<R: Read, S: FnMut(usize, u8)>(r: &mut R, width: usize, mut s
 // Decodes scanline, places it into buf
 // Precondition: buf.len() > 0
 // fb - first 4 bytes of scanline
-fn decode_old_rle<R: Read>(r: &mut R, fb: RGBE8Pixel, buf: &mut [RGBE8Pixel]) -> ImageResult<()> {
+fn decode_old_rle<R: BufRead>(r: &mut R, fb: RGBE8Pixel, buf: &mut [RGBE8Pixel]) -> ImageResult<()> {
     assert!(buf.len() > 0);
     let width = buf.len();
     // convenience function. 
@@ -527,7 +536,7 @@ fn decode_old_rle<R: Read>(r: &mut R, fb: RGBE8Pixel, buf: &mut [RGBE8Pixel]) ->
     Ok(())
 }
 
-fn read_rgbe<R: Read>(r: &mut R) -> io::Result<RGBE8Pixel> {
+fn read_rgbe<R: BufRead>(r: &mut R) -> io::Result<RGBE8Pixel> {
     let mut buf = [0u8; 4];
     try!(r.read_exact(&mut buf[..]));
     // It's actually safe: RGBE8Pixel is repr(C) and it doesn't implement Drop
@@ -750,7 +759,7 @@ fn split_at_first_test() {
 // Reads inpult until b"\n" or EOF
 // Returns vector of read bytes NOT including end of line characters
 //   or return None to indicate end of file
-fn read_line_u8<R: Read>(r: &mut R) -> ::std::io::Result<Option<Vec<u8>>> {
+fn read_line_u8<R: BufRead>(r: &mut R) -> ::std::io::Result<Option<Vec<u8>>> {
     let mut ret = Vec::with_capacity(16);
     let mut no_data = true;
 
