@@ -1,6 +1,9 @@
-use Primitive;
+extern crate rayon;
+
 use num_traits::cast::NumCast;
 use num_traits::identities::Zero;
+use Primitive;
+use self::rayon::prelude::*;
 use std::borrow::Cow;
 use std::error::Error;
 use std::io::{Read, self};
@@ -244,16 +247,14 @@ impl<R: Read> HDRDecoder<R> {
             // RGBE8Pixel doesn't implement Drop, so it's Ok to drop half-initialized ret
             ret.set_len(pixel_count);
         } // ret contains uninitialized data, so now it's my responsibility to return fully initialized ret
-        for y in 0 .. self.height as usize {
-            // first 4 bytes in scanline allow to determine compression method
-            let y_off = y * self.width as usize;
-            try!(read_scanline(&mut self.r, &mut ret[y_off .. y_off + self.width as usize]));
+        for chunk in ret.chunks_mut(self.width as usize) {
+            try!(read_scanline(&mut self.r, chunk));
         }
         Ok(ret)
     }
 
     /// Consumes decoder and returns a vector of tranformed pixels
-    pub fn read_image_transform<T, F: Fn(RGBE8Pixel)-> T>(mut self, f: F) -> ImageResult<Vec<T>> {
+    pub fn read_image_transform<T: Send, F: Sync + Fn(RGBE8Pixel)-> T>(mut self, f: F) -> ImageResult<Vec<T>> {
         // Don't read anything if image is empty 
         if self.width == 0 || self.height ==0 {
             return Ok(vec![]);
@@ -261,10 +262,6 @@ impl<R: Read> HDRDecoder<R> {
         // expression self.width > 0 && self.height > 0 is true from now to the end of this method
         // scanline buffer
         let uszwidth = self.width as usize;
-        let mut buf = Vec::<RGBE8Pixel>::with_capacity(uszwidth);
-        unsafe {
-            buf.set_len(uszwidth)
-        }
 
         let pixel_count = self.width as usize * self.height as usize;
         let mut ret = Vec::with_capacity(pixel_count);
@@ -272,14 +269,20 @@ impl<R: Read> HDRDecoder<R> {
             // RGBE8Pixel doesn't implement Drop, so it's Ok to drop half-initialized ret
             ret.set_len(pixel_count);
         } // ret contains uninitialized data, so now it's my responsibility to return fully initialized ret
-        for y in 0 .. self.height as usize {
-            // first 4 bytes in scanline allow to determine compression method
-            let y_off = y * self.width as usize;
-            try!(read_scanline(&mut self.r, &mut buf[..]));
-            for (x, &pix) in buf.iter().enumerate() {
-                ret[y_off + x] = f(pix);
-            }
+
+        let mut buf = Vec::<RGBE8Pixel>::with_capacity(pixel_count);
+        unsafe {
+            buf.set_len(pixel_count)
         }
+        for chunk in buf.chunks_mut(uszwidth) {
+            try!(read_scanline(&mut self.r, chunk));
+        }
+
+        ret.par_chunks_mut(uszwidth).zip(buf.par_chunks(uszwidth)).for_each(|(chunk, buf)| {
+            for (dst, &pix) in chunk.iter_mut().zip(buf.iter()) {
+                *dst = f(pix);
+            }
+        });
         Ok(ret)
     }
 

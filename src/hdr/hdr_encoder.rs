@@ -40,14 +40,15 @@ impl<W: Write> HDREncoder<W> {
             bufe.resize(width, 0);
             let mut rle_buf = Vec::with_capacity(width); 
             for scanline in data.chunks(width) {
-                for (i, &pix) in scanline.iter().enumerate() {
+                for ((((r,g),b),e), &pix) in bufr.iter_mut().zip(bufg.iter_mut())
+                                                    .zip(bufb.iter_mut())
+                                                    .zip(bufe.iter_mut())
+                                                    .zip(scanline.iter()) {
                     let cp = to_rgbe8(pix);
-                    unsafe {
-                        *bufr.get_unchecked_mut(i) = cp.c[0];
-                        *bufg.get_unchecked_mut(i) = cp.c[1];
-                        *bufb.get_unchecked_mut(i) = cp.c[2];
-                        *bufe.get_unchecked_mut(i) = cp.e;
-                    }
+                    *r = cp.c[0];
+                    *g = cp.c[1];
+                    *b = cp.c[2];
+                    *e = cp.e;
                 }
                 try!(write_rgbe8(w, marker)); // New RLE encoding marker
                 rle_buf.clear();
