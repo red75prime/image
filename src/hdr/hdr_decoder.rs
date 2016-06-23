@@ -761,28 +761,15 @@ fn split_at_first_test() {
 //   or return None to indicate end of file
 fn read_line_u8<R: BufRead>(r: &mut R) -> ::std::io::Result<Option<Vec<u8>>> {
     let mut ret = Vec::with_capacity(16);
-    let mut no_data = true;
-
-    loop {
-        // read_byte uses Read::read_exact, so I don't need to bother myself about EINTR
-        match read_byte(r) {
-            Ok(byte) => {
-                no_data = false;
-                // HDR format doesn't specify encoding of end-of-line
-                // C implementation uses fgets
-                // Let's assume it is '\n'
-                if byte == b'\n' {
-                    // "\n" line ending
-                    return Ok(Some(ret));
-                } // end of EOL processing
-                ret.push(byte);
-            },
-            Err(ref err) if err.kind() == io::ErrorKind::UnexpectedEof => {
-                // EOF
-                return if no_data { Ok(None) } else { Ok(Some(ret)) };
-            },
-            Err(err) => return Err(err), // report all other errors
-        }
+    match r.read_until(b'\n', &mut ret) {
+        Ok(0) => Ok(None),
+        Ok(_) => {
+            if let Some(&b'\n') = ret[..].last() {
+                let _ = ret.pop();
+            }
+            Ok(Some(ret))
+        },
+        Err(err) => Err(err),
     }
 }
 
