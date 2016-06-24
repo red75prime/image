@@ -1,9 +1,7 @@
-extern crate scoped_threadpool;
-
 use num_traits::cast::NumCast;
 use num_traits::identities::Zero;
 use Primitive;
-use self::scoped_threadpool::Pool;
+use super::scoped_threadpool::Pool;
 use std::borrow::Cow;
 use std::error::Error;
 use std::io::{BufRead, self};
@@ -25,6 +23,7 @@ pub struct HDRAdapter<R: BufRead> {
 }
 
 impl<R: BufRead> HDRAdapter<R> {
+    /// Creates adapter 
     pub fn new(r: R) -> ImageResult<HDRAdapter<R>> {
         let decoder = try!(HDRDecoder::new(r));
         let meta = decoder.metadata();
@@ -34,6 +33,7 @@ impl<R: BufRead> HDRAdapter<R> {
         })
     }
 
+    /// Allows reading old Radiance HDR images
     pub fn new_nonstrict(r: R) -> ImageResult<HDRAdapter<R>> {
         let decoder = try!(HDRDecoder::with_strictness(r, false));
         let meta = decoder.metadata();
@@ -143,7 +143,6 @@ impl RGBE8Pixel {
                 NumCast::from(fv).expect("to_ldr_scale_gamma: cannot convert f32 to target type. NaN?")
             }
         }
-        // TODO: use huon's simd
         Rgb([sg(r, scale, gamma), sg(g, scale, gamma), sg(b, scale, gamma)])
     }
 
